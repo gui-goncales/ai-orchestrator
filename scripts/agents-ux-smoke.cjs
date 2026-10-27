@@ -1,0 +1,27 @@
+const {chromium}=require('playwright');const fs=require('node:fs');
+(async()=>{const browser=await chromium.launch({channel:'chrome',headless:true});try{
+ const page=await browser.newPage({viewport:{width:1440,height:1100}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.goto('http://127.0.0.1:8788');await page.getByText('Conectado',{exact:true}).waitFor();await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('heading',{name:'Seu time de IA, conectado.',exact:true}).waitFor();
+ await page.getByRole('button',{name:'Prontos',exact:true}).click();if(await page.locator('.connection-card').count()!==1)throw Error('Ready filter wrong');
+ await page.getByRole('button',{name:'Todos',exact:true}).click();await page.getByLabel('Buscar agentes').fill('not-a-provider');await page.getByRole('heading',{name:'Nenhum agente encontrado'}).waitFor();await page.getByLabel('Buscar agentes').fill('');
+ await page.getByRole('button',{name:'Conectar agente',exact:true}).click();const dialog=page.getByRole('dialog');
+ await dialog.getByRole('button',{name:'Outro provedor',exact:false}).click();
+ if(await dialog.locator('details[open]').count())throw Error('Advanced fields exposed by default');
+ const providerName='UX Test '+Date.now();await dialog.getByLabel('Nome do agente',{exact:true}).fill(providerName);await dialog.getByLabel('Endereço do site',{exact:true}).fill('http://unsafe.example');
+ await dialog.getByRole('button',{name:'Continuar',exact:false}).click();await dialog.getByRole('alert').waitFor();
+ await dialog.getByLabel('Endereço do site',{exact:true}).fill('https://example.com');await dialog.getByRole('button',{name:'Continuar',exact:false}).click();
+ await dialog.getByRole('heading',{name:'Agora, entre na sua conta.',exact:true}).waitFor();
+ const state=await page.evaluate(async()=>await(await fetch('/api/state')).json());const provider=state.providers.find(p=>p.name===providerName);
+ if(!provider||provider.config.login_url!=='https://example.com'||!provider.id.startsWith('web-'))throw Error('Custom provider not persisted');
+ await dialog.getByRole('button',{name:'Já entrei, verificar',exact:true}).click();await dialog.getByRole('status').waitFor();
+ if((await dialog.getByRole('status').innerText()).includes('Controles encontrados'))throw Error('Missing session marked ready');
+ await page.keyboard.press('Escape');await dialog.waitFor({state:'hidden'});
+ await page.getByRole('button',{name:'Conectar agente',exact:true}).click();await dialog.getByRole('button',{name:'Tess',exact:false}).click();await dialog.getByRole('button',{name:'Continuar',exact:false}).click();await dialog.getByRole('heading',{name:'Agora, entre na sua conta.',exact:true}).waitFor();await dialog.getByRole('button',{name:'Fechar conexão',exact:true}).click();
+ await page.screenshot({path:'evidence/agents-ux-desktop.png',fullPage:true});
+ await page.setViewportSize({width:390,height:844});await page.screenshot({path:'evidence/agents-ux-mobile.png',fullPage:true});if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1))throw Error('Mobile overflow');
+ await page.getByRole('button',{name:'Conectar agente',exact:true}).click();await page.screenshot({path:'evidence/agents-ux-wizard.png',fullPage:true});if(await dialog.evaluate(el=>el.scrollWidth>el.clientWidth+1))throw Error('Dialog overflow');
+ await page.keyboard.press('Escape');await page.getByRole('button',{name:'Usar agente',exact:true}).first().click();await page.getByRole('dialog').getByLabel('Agente',{exact:true}).waitFor();if(await page.getByLabel('Agente',{exact:true}).inputValue()!=='codex')throw Error('Card agent not preselected');
+ if(errors.length)throw Error(errors.join('\n'));
+ fs.writeFileSync('evidence/agents-ux.json',JSON.stringify({passed:true,mode:'isolated backend; no external model call',checks:['ready filter','search and empty state','guided custom provider creation','HTTPS validation inline','generated provider ID persisted','advanced fields collapsed','missing session not reported ready','existing Tess connection editable','mobile layout','accessible dialog and Escape','use agent preselects task provider','no JS errors']},null,2));console.log('PASS: Agents UX and custom provider wizard');
+ }finally{await browser.close()}})().catch(e=>{console.error(e);process.exit(1)});

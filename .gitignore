@@ -1,0 +1,18 @@
+node_modules/
+frontend/dist/
+data/
+__pycache__/
+*.pyc
+.DS_Store
+
+tools/bin/
+
+artifacts/
+
+.env
+.env.*
+!.env.example
+
+# Local execution evidence can contain account details and screenshots.
+evidence/
+*.log

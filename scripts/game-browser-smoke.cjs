@@ -1,0 +1,26 @@
+const {chromium}=require('/Users/guilherme/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+(async()=>{
+ const browser=await chromium.launch({channel:'chrome',headless:true,args:['--use-angle=swiftshader','--enable-unsafe-swiftshader']});
+ const page=await browser.newPage({viewport:{width:1440,height:900}});const errors=[];const failed=[];
+ page.on('pageerror',e=>errors.push(e.message));page.on('response',r=>{if(r.status()>=400)failed.push(r.url()+':'+r.status())});
+ await page.goto('http://127.0.0.1:8789/916cb60f6365/');
+ await page.waitForFunction(()=>!!window.__gameTest,{timeout:30000});
+ await page.screenshot({path:'evidence/dead-zone-menu.png'});
+ await page.locator('#play').click();await page.waitForTimeout(1200);
+ const before=await page.evaluate(()=>window.__gameTest.getState());
+ await page.keyboard.down('w');await page.waitForTimeout(1300);await page.keyboard.up('w');
+ await page.mouse.move(950,450);await page.mouse.down();await page.waitForTimeout(900);await page.mouse.up();
+ const after=await page.evaluate(()=>window.__gameTest.getState());
+ await page.keyboard.press('Escape');await page.waitForTimeout(200);
+ const paused=await page.evaluate(()=>window.__gameTest.getState());
+ await page.keyboard.press('Escape');await page.waitForTimeout(600);
+ const resumed=await page.evaluate(()=>window.__gameTest.getState());
+ if(before.phase!=='playing'||after.phase!=='playing'||paused.phase!=='paused'||resumed.phase!=='playing')throw Error('Gameplay/pause transitions failed');
+ if(Math.hypot(after.player.x-before.player.x,after.player.z-before.player.z)<.1)throw Error('Keyboard movement failed');
+ if(after.ammo>=before.ammo)throw Error('Firing did not consume ammunition');
+ await page.screenshot({path:'evidence/dead-zone-gameplay.png'});
+ const manifest=await page.evaluate(()=>({canvas:!!document.querySelector('canvas'),width:document.querySelector('canvas')?.width,height:document.querySelector('canvas')?.height}));
+ if(errors.length||failed.length)throw Error(JSON.stringify({errors,failed}));
+ require('fs').writeFileSync('evidence/dead-zone-browser-test.json',JSON.stringify({scope:'Desktop headless Chrome software WebGL: start, keyboard movement, firing, pause and resume. Not full-match or physical-device performance validation.',before,after,paused,resumed,render:manifest,page_errors:errors,failed_requests:failed},null,2));
+ console.log(JSON.stringify({before,after,paused,resumed,render:manifest,page_errors:errors}));await browser.close();
+})().catch(e=>{console.error(e);process.exit(1)});
