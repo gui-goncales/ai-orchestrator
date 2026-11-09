@@ -1,15 +1,14 @@
 """
-Decision Engine inspirado na arquitetura System One (Jev / TypeSafe AI).
-Executa decisões tipadas (Choice, Score, Noul) sobre o estado de uma tarefa ou software
-sem geração de texto livre, com 0% de erro de tipo e avaliação probabilística calibrada.
+Decisões tipadas independentes com inferência opcional local e abstenção.
+Distribuições locais não representam correção calibrada.
 """
 from __future__ import annotations
 import json
 import os
 import re
-import math
 from typing import Dict, List, Any, Optional, Union
-from urllib import request, error
+from backend.decision_scoring import score_questions
+from backend.agent_routing import exclusion_reason
 
 # ==========================================
 # Primitivas Tipadas (System One Primitives)
@@ -17,6 +16,8 @@ from urllib import request, error
 
 class Question:
     def __init__(self, instructions: str):
+        if not isinstance(instructions, str) or not instructions.strip():
+            raise ValueError("Instruções devem ser texto não vazio")
         self.instructions = instructions
 
 class Choice(Question):
@@ -24,6 +25,8 @@ class Choice(Question):
     def __init__(self, instructions: str, criteria: Union[List[str], Dict[str, Optional[str]]]):
         super().__init__(instructions)
         if isinstance(criteria, list):
+            if any(not isinstance(c, str) or not c for c in criteria) or len(set(criteria)) != len(criteria):
+                raise ValueError("Opções devem ser textos únicos não vazios")
             self.criteria = {c: None for c in criteria}
         elif isinstance(criteria, dict):
             self.criteria = criteria
@@ -31,6 +34,9 @@ class Choice(Question):
             raise ValueError("Criteria deve ser lista ou dicionário de opções.")
         if not self.criteria:
             raise ValueError("Choice question requer pelo menos uma opção.")
+        if any(not isinstance(k, str) or not k or (v is not None and not isinstance(v, str)) for k, v in self.criteria.items()):
+            raise ValueError("Opções e descrições devem ser textos")
+        self.criteria = dict(self.criteria)
 
 class Score(Question):
     """Avaliação contínua/discreta sobre um espectro ordenado (rubrica)."""
@@ -38,10 +44,12 @@ class Score(Question):
         super().__init__(instructions)
         if not isinstance(criteria, list) or len(criteria) < 2:
             raise ValueError("Score question requer lista ordenada com pelo menos 2 níveis.")
-        self.criteria = criteria
+        if any(not isinstance(c, str) or not c for c in criteria) or len(set(criteria)) != len(criteria):
+            raise ValueError("Níveis devem ser textos únicos não vazios")
+        self.criteria = list(criteria)
 
 class Noul(Question):
-    """Proposição binária que retorna probabilidade calibrada (0.0 a 1.0)."""
+    """Proposição binária que retorna uma probabilidade (0.0 a 1.0)."""
     def __init__(self, instructions: str):
         super().__init__(instructions)
 
@@ -84,11 +92,19 @@ class DecisionResult:
         self.nouls: Dict[str, NoulResult] = {}
         self.engine_used: str = "local"
         self.reason: str = ""
+        self.abstentions = {}
+        self.shadow = None
+
+    def usable(self, question):
+        return question not in self.abstentions and question in {**self.choices, **self.scores, **self.nouls}
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "engine": self.engine_used,
             "reason": self.reason,
+            "calibrated": False,
+            "abstentions": self.abstentions,
+            "shadow": self.shadow,
             "choices": {k: {"choice": v.choice, "probabilities": v.probabilities, "confidence": v.confidence} for k, v in self.choices.items()},
             "scores": {k: {"score": v.score, "probabilities": v.probabilities, "confidence": v.confidence} for k, v in self.scores.items()},
             "nouls": {k: {"noul": v.noul, "confidence": v.confidence} for k, v in self.nouls.items()},
@@ -101,9 +117,75 @@ class DecisionResult:
 
 class Decision:
     """
-    Ponto central para emissão de decisões estruturadas System One.
-    Conecta-se ao Jev (TypeSafe AI) quando configurado ou opera em fallback local determinístico.
+    Decisões estruturadas com backend local explícito ou abstenção neutra.
+    Nenhuma variável de credencial habilita serviços externos.
     """
+
+    @staticmethod
+    def classify_mode(objective, requested_mode="auto", authorization=None):
+        """Classify the requested outcome and enforce explicit capability grants."""
+        requested = str(requested_mode or "auto").lower()
+        if requested not in ("auto", "work", "analyze", "plan", "artifact"):
+            raise ValueError("Modo solicitado inválido")
+        words = re.sub(r'"[^"\n]*"|“[^”\n]*”|`[^`\n]*`', ' ', objective.casefold())
+        # Separate intent from quoted examples and negative/explanatory clauses.
+        actionable = []
+        for clause in re.split(r'[.!?;\n]+|\b(?:mas|but)\b', words):
+            clause = re.sub(r"\b(?:não|nao|do not|don't|never|sem|without)\b.*$", '', clause)
+            clause = re.sub(r'\b(?:como|how to)\s+(?:implementar|corrigir|refatorar|alterar|fix|implement|modify|build)\b.*$', '', clause)
+            if re.search(r'\b(?:planeje|planejar|planejamento|plano|roadmap|plan)\b', clause):
+                clause = re.split(r'\b(?:depois|then)\b', clause, maxsplit=1)[-1] if re.search(r'\b(?:depois|then)\b', clause) else ''
+            actionable.append(clause)
+        action_words = ' '.join(actionable)
+        mutation = bool(re.search(r"\b(?:implemente|implementar|corrija|corrigir|refatore|refatorar|desenvolva|desenvolver|execute|executar|aplique|aplicar|implement|fix|modify|build)\b", action_words))
+        artifact = bool(re.search(r"\b(?:crie|criar|gere|gerar|create|generate)\b.{0,90}\b(?:pdf|documento|relatório|planilha|slides|arquivo|artefato)\b", action_words))
+        planning = bool(re.search(r"\b(?:planeje|planejar|planejamento|plano|roadmap|plan)\b", words))
+        creation = bool(re.search(r"\b(?:crie|criar|create|gere|gerar)\b", action_words))
+        if requested != "auto":
+            selected, reason = requested, "Seleção manual preservada"
+        elif mutation or (creation and not artifact and not planning and not re.search(r"\b(?:jogo|game)\b", words)):
+            selected, reason = "work", "Implementação real solicitada"
+        elif artifact or (creation and bool(re.search(r"\b(?:jogo|game)\b", words))):
+            selected, reason = "artifact", "Artefato solicitado"
+        elif planning:
+            selected, reason = "plan", "Planejamento solicitado"
+        else:
+            selected, reason = "analyze", "Análise sem alteração solicitada"
+        required = {"read_files"}
+        if selected in ("work", "artifact"):
+            required.add("write_files")
+        if selected == "work":
+            required.add("run_commands")
+        capabilities = {"read_files", "write_files", "run_commands"}
+        if authorization is not None and (not isinstance(authorization, dict) or set(authorization) - capabilities or any(type(v) is not bool for v in authorization.values())):
+            raise ValueError("Autorizações devem mapear capacidades conhecidas para booleanos")
+        # An inferred mode describes intent; only an explicit workflow or grants
+        # authorizes mutation. Auto without grants remains read-only.
+        grants = ({"read_files"} if requested == "auto" else capabilities) if authorization is None else {k for k, v in authorization.items() if v is True}
+        missing = sorted(required - grants)
+        permitted = [op for cap, op in (("read_files", "read"), ("write_files", "write"), ("run_commands", "execute")) if cap in required and cap in grants]
+        result = {"requested_mode": requested, "selected_mode": selected, "decision_reason": reason, "confidence": None, "classification_method": "deterministic", "required_capabilities": sorted(required), "permitted_operations": permitted, "permission_conflict": bool(missing), "missing_capabilities": missing, "fallback_policy": "safe", "recovery_strategy": "checkpoint_aware", "authorization_source": "explicit_grants" if authorization is not None else "read_only_default" if requested == "auto" else "explicit_workflow"}
+        # The semantic layer observes intent; it never changes capability grants.
+        if requested == 'auto' and os.environ.get('DECISION_MODE', 'off') != 'off':
+            review = Decision.decide(objective, {'mode': Choice('Qual entrega o usuário solicita agora?', {
+                'analyze': 'Analisar ou explicar sem modificar arquivos',
+                'plan': 'Planejar ações futuras sem executar agora',
+                'work': 'Implementar ou corrigir o projeto',
+                'artifact': 'Criar documento, relatório, planilha ou slides como arquivo'})})
+            if os.environ.get('DECISION_MODE') == 'shadow':
+                result['semantic_review'] = review.shadow
+            else:
+                result['semantic_review'] = review.to_dict()
+                result['decision_blocked'] = not review.usable('mode')
+                if review.usable('mode'):
+                    choice = review.choices['mode']
+                    result.update(selected_mode=choice.choice, confidence=choice.confidence,
+                                  classification_method='local-scorer', decision_reason='Modo proposto pelo avaliador semântico local')
+                    required = {'read_files'} | ({'write_files'} if choice.choice in ('work', 'artifact') else set()) | ({'run_commands'} if choice.choice == 'work' else set())
+                    result.update(required_capabilities=sorted(required), missing_capabilities=sorted(required - grants),
+                                  permission_conflict=bool(required - grants),
+                                  permitted_operations=[op for cap, op in (('read_files', 'read'), ('write_files', 'write'), ('run_commands', 'execute')) if cap in required and cap in grants])
+        return result
 
     @classmethod
     def plan_task(cls, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -125,19 +207,20 @@ class Decision:
                     active_objective = previous
                     break
         workflow = task.get('workflow', 'direct')
-        onboarding = bool(re.search(
-            r'primeir[oa]\s+(?:vez|contato)|conhe[cç]a|entenda|entender|familiariz|first (?:look|contact)|onboard',
-            active_objective, re.IGNORECASE))
-        analysis = onboarding or bool(re.search(
-            r'an[aá]lis|analis|revis|audit|diagn[oó]st|review|assess|investig',
-            active_objective, re.IGNORECASE))
-        writable = workflow in ('work', 'improve', 'deliver')
+        decision = spec.get("mode_decision")
+        if not isinstance(decision, dict):
+            decision = cls.classify_mode(active_objective, {"work": "work", "improve": "work", "direct": "analyze", "rea": "plan", "deliver": "artifact", "auto": "auto"}.get(workflow, "analyze"))
+        selected_mode = decision["selected_mode"]
+        analysis = selected_mode in ("analyze", "plan")
+        writable = selected_mode in ("work", "artifact")
+        permitted = decision.get("permitted_operations", [])
         return {
             'objective': objective,
             **({'active_objective': active_objective} if active_objective != objective else {}),
             'mode': 'analysis' if analysis else 'execute' if writable else 'respond',
-            'write_allowed': writable,
-            'commands_allowed': writable,
+            'mode_decision': decision,
+            'write_allowed': writable and 'write' in permitted,
+            'commands_allowed': writable and 'execute' in permitted,
             'required_evidence': cls.completion_requirements(active_objective, workflow),
             'instructions': [
                 'O campo objective contém o pedido atual do usuário e determina a entrega. '
@@ -181,14 +264,28 @@ class Decision:
         # run_command. They do not promise a persistent implementation change.
         if re.search(r'\bauditoria\s+prática\b.{0,100}\bcapacidades\b', objective, re.I | re.S):
             return {'mutation': False, 'command': True}
-        clauses = re.split(r'[.!?;\n]+', objective.casefold())
-        clauses = [re.sub(r'\bcomo\s+(?:implementar|corrigir|alterar|editar|criar|adicionar|refatorar)\b', '', c) for c in clauses]
-        actionable = ' '.join(c for c in clauses if not re.search(
-            r'\b(?:não|nao|never|do not|don.t)\b', c))
+        def actionable_clauses(text):
+            clauses = re.split(r'[.!?;\n]+', text)
+            clauses = [re.sub(r'\bcomo\s+(?:implementar|corrigir|alterar|editar|criar|adicionar|refatorar)\b', '', c) for c in clauses]
+            # A conditional repair grants permission; it does not promise a file change.
+            clauses = [c for c in clauses if not re.search(
+                r'\b(?:se|caso)\s+(?:precisar|for necess[aá]rio|houver necessidade)|\bif\s+(?:needed|necessary)\b', c)]
+            return ' '.join(c for c in clauses if not re.search(
+                r'\b(?:não|nao|never|do not|don.t)\b', c))
+
+        text = objective.casefold()
+        actionable = actionable_clauses(text)
+        # Reference names are data, not action verbs: reading context-fix.md must
+        # not force a mutation. Keep the original text for command detection so
+        # an explicit request to run tests/test_core.py still requires evidence.
+        without_references = re.sub(
+            r'https?://[^\s<>]+|(?<!\w)(?:[\w.@+-]+[/\\])+[\w.@+-]*|'
+            r'(?<!\w)[\w@+-]+(?:\.[\w@+-]+)+', ' ', text)
+        mutation_actions = actionable_clauses(without_references)
         return {
             'mutation': bool(re.search(
                 r'\b(?:implemente|implementar|corrija|corrigir|melhore|altere|alterar|edite|editar|'
-                r'crie|criar|adicione|adicionar|refatore|refatorar|implement|fix|modify|create|write)\b', actionable)),
+                r'crie|criar|adicione|adicionar|refatore|refatorar|implement|fix|modify|create|write)\b', mutation_actions)),
             'command': bool(re.search(
                 r'\b(?:execute|executar|rode|rodar|run)\b.{0,120}\b(?:testes?|tests?|unittest|pytest|build|comandos?|commands?)\b', actionable)),
         }
@@ -198,19 +295,37 @@ class Decision:
         cls,
         state: Union[str, Dict[str, Any]],
         questions: Dict[str, Question],
-        model: str = "jev-latest",
-        force_local: bool = False
+        model: Optional[str] = None,
+        force_local: bool = False,
+        scorer=None
     ) -> DecisionResult:
-        api_key = os.environ.get("TYPESAFE_API_KEY")
-
-        if api_key and not force_local:
+        # model/force_local remain accepted for existing callers; never enable HTTP.
+        if not isinstance(questions, dict) or not questions:
+            raise ValueError("Ao menos uma pergunta é obrigatória")
+        if any(not isinstance(q, (Choice, Score, Noul)) for q in questions.values()):
+            raise ValueError("Tipo de pergunta não suportado")
+        if scorer is not None:
+            return score_questions(state, questions, scorer)
+        if force_local:
+            return cls._evaluate_locally(state, questions)
+        from backend.decision_runtime import configured_scorer
+        try:
+            mode, scorer = configured_scorer()
+        except Exception as exc:
+            if os.environ.get('DECISION_MODE') != 'shadow':
+                raise
+            result = cls._evaluate_locally(state, questions)
+            result.shadow = {'status': 'unavailable', 'error_type': type(exc).__name__}
+            return result
+        if mode == 'on':
+            return score_questions(state, questions, scorer)
+        result = cls._evaluate_locally(state, questions)
+        if mode == 'shadow':
             try:
-                return cls._call_typesafe_api(state, questions, model, api_key)
-            except Exception:
-                # Fallback transparente para o motor local calibrado caso a API falhe
-                pass
-
-        return cls._evaluate_locally(state, questions)
+                result.shadow = score_questions(state, questions, scorer).to_dict()
+            except Exception as exc:
+                result.shadow = {'status': 'unavailable', 'error_type': type(exc).__name__}
+        return result
 
     @classmethod
     def decide_failover(
@@ -218,21 +333,23 @@ class Decision:
         task: Dict[str, Any],
         failed_provider: str,
         error_details: str,
-        available_providers: List[Dict[str, Any]]
+        available_providers: List[Dict[str, Any]],
+        error_status: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Decide automaticamente se a tarefa deve comutar para outro modelo/provedor quando ocorre
         falha de execução ou limite de uso/cota (ex: 'You've hit your usage limit').
         """
+        # A local configuration/authentication error is not a service outage.
+        if error_status == "rate_limited":
+            error_details = "rate limit: " + error_details
+        if not re.search(r"usage limit|rate limit|quota|429|529|503|service unavailable|temporarily unavailable|limite de uso|cota", error_details, re.I):
+            return None
         # Filtrar candidatos que não sejam o que acabou de falhar e que sejam modelos geradores elegíveis
         candidates = [
             p for p in available_providers
             if p["id"] != failed_provider
-            and p["id"] != "rea"  # REA é motor estático de análise de artefatos, não modelo gerador
-            and p.get("installed", False)
-            and not p.get('automatic_routing_blocked', False)
-            and p.get("state") in ("available", "ready")
-            and (p["id"] in ("codex", "antigravity") or p.get("automatic_routing"))
+            and exclusion_reason(p) is None
         ]
 
         if not candidates:
@@ -282,98 +399,30 @@ class Decision:
         # Avaliação
         res = cls.decide(state, questions)
 
+        if res.engine_used != 'local-scorer':
+            substitute_id = sorted(candidate_options)[0]
+            return {
+                "selected_provider": substitute_id, "confidence": None,
+                "classification_method": "deterministic",
+                "reason": f"Alternância automática: falha de serviço/cota reconhecida; provedor elegível '{substitute_id}' selecionado por ordem estável. Sem avaliação semântica de continuidade.",
+                "details": res.to_dict(),
+            }
+        if not all(res.usable(name) for name in questions):
+            return None
         substitute_id = res.choices["selected_substitute"].choice
-        p_failover = res.nouls["should_failover"].noul
-        confidence = res.choices["selected_substitute"].confidence
-
-        # Se a probabilidade de failover for favorável (> 0.4) e temos um substituto
-        if substitute_id:
-            reason = (
-                f"Alternância automática acionada: '{failed_provider}' atingiu restrição de uso/falha "
-                f"({error_details[:60]}...). O modelo de Decision (System One) selecionou '{substitute_id}' "
-                f"(confiança: {confidence:.2f}, continuidade: {res.scores['continuity_feasibility'].score:.2f}) "
-                f"para prosseguir a partir do checkpoint."
-            )
+        if (substitute_id in candidate_options
+                and res.nouls["should_failover"].noul >= 0.8
+                and res.nouls["is_quota_or_service_fault"].noul >= 0.8
+                and res.scores["continuity_feasibility"].score >= 1.0):
             return {
                 "selected_provider": substitute_id,
-                "confidence": confidence,
-                "reason": reason,
-                "details": res.to_dict()
+                "confidence": res.choices["selected_substitute"].confidence,
+                "classification_method": "local-scorer",
+                "reason": f"Alternância automática: avaliador local selecionou '{substitute_id}' após os gates de continuidade.",
+                "details": res.to_dict(),
             }
 
         return None
-
-    @classmethod
-    def _call_typesafe_api(
-        cls,
-        state: Union[str, Dict[str, Any]],
-        questions: Dict[str, Question],
-        model: str,
-        api_key: str
-    ) -> DecisionResult:
-        payload_questions = {}
-        for q_id, q in questions.items():
-            if isinstance(q, Choice):
-                payload_questions[q_id] = {
-                    "type": "choice",
-                    "instructions": q.instructions,
-                    "criteria": q.criteria
-                }
-            elif isinstance(q, Score):
-                payload_questions[q_id] = {
-                    "type": "score",
-                    "instructions": q.instructions,
-                    "criteria": q.criteria
-                }
-            elif isinstance(q, Noul):
-                payload_questions[q_id] = {
-                    "type": "noul",
-                    "instructions": q.instructions
-                }
-
-        payload = {
-            "model": model,
-            "state": state if isinstance(state, str) else json.dumps(state, ensure_ascii=False),
-            "questions": payload_questions
-        }
-
-        req = request.Request(
-            "https://api.typesafe.ai/v1/systemone",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": "AI-Orchestrator-Decision/1.0"
-            },
-            data=json.dumps(payload).encode("utf-8")
-        )
-
-        with request.urlopen(req, timeout=5.0) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-
-        result = DecisionResult()
-        result.engine_used = "typesafe-jev"
-
-        for k, v in data.get("choices", {}).items():
-            result.choices[k] = ChoiceResult(
-                choice=v["choice"],
-                probabilities=v.get("probabilities", {v["choice"]: 1.0}),
-                confidence=v.get("confidence", 1.0)
-            )
-
-        for k, v in data.get("scores", {}).items():
-            result.scores[k] = ScoreResult(
-                score=float(v["score"]),
-                probabilities=v.get("probabilities", {}),
-                confidence=v.get("confidence", 1.0)
-            )
-
-        for k, v in data.get("nouls", {}).items():
-            result.nouls[k] = NoulResult(
-                noul=float(v["noul"]),
-                confidence=v.get("confidence", 1.0)
-            )
-
-        return result
 
     @classmethod
     def _evaluate_locally(
@@ -382,70 +431,20 @@ class Decision:
         questions: Dict[str, Question]
     ) -> DecisionResult:
         """
-        Motor probabilístico local para ambientes sem conexão externa.
-        Computa probabilidades calibradas com 0% de erro de tipo.
+        Compatibilidade sem inferência semântica: distribuições neutras.
+        Todos os resultados são marcados como abstenção, não como evidência.
         """
-        raw_text = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
-        text_lower = raw_text.casefold()
-        words = set(re.findall(r"\w{3,}", text_lower))
-
         result = DecisionResult()
-        result.engine_used = "local-calibrated"
-
-        for q_id, q in questions.items():
+        result.engine_used = "local-heuristic"
+        result.reason = "Sem inferência semântica autoritativa; resultados neutros de compatibilidade."
+        result.abstentions = {name: 'Sem avaliação semântica; resultado neutro não autoriza ação' for name in questions}
+        for name, q in questions.items():
             if isinstance(q, Choice):
-                options = list(q.criteria.keys())
-                scores = {}
-                for opt in options:
-                    opt_words = set(re.findall(r"\w{3,}", opt.casefold()))
-                    desc_words = set(re.findall(r"\w{3,}", (q.criteria[opt] or "").casefold()))
-                    target_words = opt_words | desc_words
-                    overlap = len(words & target_words)
-                    scores[opt] = 1.0 + (overlap * 2.5)
-
-                max_s = max(scores.values()) if scores else 0
-                exp_scores = {opt: math.exp(s - max_s) for opt, s in scores.items()}
-                sum_exp = sum(exp_scores.values()) or 1.0
-                probs = {opt: round(val / sum_exp, 4) for opt, val in exp_scores.items()}
-
-                chosen = max(probs.items(), key=lambda x: x[1])[0] if probs else (options[0] if options else "")
-                confidence = probs.get(chosen, 1.0)
-                result.choices[q_id] = ChoiceResult(chosen, probs, confidence)
-
+                probabilities = {option: 1.0 / len(q.criteria) for option in q.criteria}
+                result.choices[name] = ChoiceResult(next(iter(q.criteria)), probabilities, 0.0)
             elif isinstance(q, Score):
-                levels = q.criteria
-                n_levels = len(levels)
-                intensity = 0.5
-                if any(w in text_lower for w in ("limit", "limite", "quota", "usage", "failed", "bloquead", "erro")):
-                    intensity = 0.8
-                elif any(w in text_lower for w in ("safe", "ok", "disponível", "sucesso", "leve")):
-                    intensity = 0.3
-
-                probs = {}
-                for i, lvl in enumerate(levels):
-                    center = i / (n_levels - 1)
-                    dist = abs(intensity - center)
-                    probs[lvl] = round(math.exp(-2.5 * dist), 4)
-
-                total_p = sum(probs.values()) or 1.0
-                probs = {k: round(v / total_p, 4) for k, v in probs.items()}
-                calc_score = sum(i * probs[lvl] for i, lvl in enumerate(levels))
-                result.scores[q_id] = ScoreResult(round(calc_score, 2), probs, max(probs.values()))
-
-            elif isinstance(q, Noul):
-                instr_words = set(re.findall(r"\w{3,}", q.instructions.casefold()))
-                pos_signals = len(words & instr_words)
-                # Expansão semântica para código / escrita
-                if any(k in q.instructions.casefold() for k in ("código", "codigo", "code", "escrita", "geração", "implement")):
-                    if any(w in text_lower for w in ("typescript", "python", "javascript", "código", "codigo", "code", "implement", "bug", "build", "teste", "class", "def ", "function")):
-                        pos_signals += 2
-                # Boost para sinais de cota/limite
-                if any(k in text_lower for k in ("usage limit", "rate limit", "hit your usage", "429", "upgrade to pro")):
-                    pos_signals += 3
-
-                p = 1.0 / (1.0 + math.exp(-1.1 * (pos_signals - 1.0)))
-                p_calibrated = round(min(0.99, max(0.01, p)), 4)
-                conf = round(abs(p_calibrated - 0.5) * 2.0, 2)
-                result.nouls[q_id] = NoulResult(p_calibrated, conf)
-
+                probabilities = {level: 1.0 / len(q.criteria) for level in q.criteria}
+                result.scores[name] = ScoreResult((len(q.criteria) - 1) / 2, probabilities, 0.0)
+            else:
+                result.nouls[name] = NoulResult(0.5, 0.0)
         return result

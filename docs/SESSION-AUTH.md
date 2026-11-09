@@ -1,6 +1,8 @@
 # Conexões pela conta
 
-O fluxo ativo do orquestrador usa autenticação das CLIs (Codex, Google) ou a sessão de uma janela Chrome dedicada (Tess e outros sites configurados). Não solicita chave de API. Configurações API antigas ficam preservadas no banco como histórico, mas não são carregadas, selecionadas ou aceitas para novas tarefas.
+Para **Tess por token**, consulte [API-PROVIDERS.md](API-PROVIDERS.md); a integração API própria coexiste com os fluxos abaixo.
+
+O fluxo de sessões do orquestrador usa autenticação das CLIs (Codex, Google) ou a sessão de uma janela Chrome dedicada (Tess e outros sites configurados). Não solicita chave de API. Configurações API antigas ficam preservadas no banco como histórico, mas não são carregadas, selecionadas ou aceitas para novas tarefas.
 
 ## Usar Tess
 

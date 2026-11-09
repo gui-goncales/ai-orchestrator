@@ -107,6 +107,8 @@ O [fluxo de implementação](docs/DELIVERY.md) adiciona escrita por Codex em `ar
 
 Após criar o artefato, o supervisor captura telas reais desktop/mobile e envia os PNGs ao agente em uma revisão read-only. O dashboard mostra imagens e sugestões priorizadas. O botão **Analisar visualmente** também permite solicitar a análise, reaproveitada para a mesma versão sem outra chamada. [Fluxo, isolamento e limites](docs/VISUAL-REVIEW.md). Esta etapa propõe melhorias; não altera o código automaticamente nem substitui o aceite humano.
 
-## Tess e outros modelos com login da conta
+## Tess por token e outros modelos com login da conta
 
-Em **Agents → Conectar pela conta**, use **Abrir login**, entre no provedor e abra uma conversa. Use **Verificar sessão** e selecione Tess em Nova tarefa, com Resposta ou Planejamento REA. O Tess tem mapeamento de interface incluído; outros sites precisam de seletores próprios. O backend usa o Chrome dedicado com a sessão pessoal, sem chave de API. Conexões por API da versão anterior não são carregadas nem aceitas. [Autenticação, evidência REA e limites](docs/SESSION-AUTH.md).
+Para Tess por API, configure `TESS_API_KEY` no backend e escolha Tess no chat. O Orchestrator pode escolher o modelo automaticamente ou usar sua seleção manual, com catálogo consultado na conta. [Configuração e limites](docs/API-PROVIDERS.md).
+
+Para conexões de navegador, em **Agents → Conectar pela conta**, use **Abrir login**, entre no provedor e abra uma conversa. Use **Verificar sessão** e selecione Tess em Nova tarefa, com Resposta ou Planejamento REA. O Tess tem mapeamento de interface incluído; outros sites precisam de seletores próprios. O backend usa o Chrome dedicado com a sessão pessoal, sem chave de API. Conexões genéricas por API da versão anterior não são carregadas nem aceitas; Tess por token tem integração própria. [Autenticação, evidência REA e limites](docs/SESSION-AUTH.md).

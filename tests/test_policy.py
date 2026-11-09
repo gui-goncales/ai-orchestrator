@@ -177,7 +177,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(selected,'antigravity')
         self.assertIn('amostras aceitas',decision['reason'])
 
-    def test_decision_primitives_typesafe_jev(self):
+    def test_decision_primitives_local_heuristic(self):
         from backend.decision import Decision, Choice, Score, Noul
         state = "Implementar componente de busca com debounce em TypeScript e testes unitários."
         questions = {
@@ -187,12 +187,14 @@ class PolicyTests(unittest.TestCase):
         }
         res = Decision.decide(state, questions, force_local=True)
         self.assertIn("needs_code", res.nouls)
-        self.assertGreater(res.nouls["needs_code"].noul, 0.5)
+        self.assertEqual(res.nouls["needs_code"].noul, 0.5)
+        self.assertFalse(res.usable("needs_code"))
         self.assertIn("complexity", res.scores)
         self.assertTrue(0.0 <= res.scores["complexity"].score <= 2.0)
         self.assertIn("preferred_service", res.choices)
         self.assertIn(res.choices["preferred_service"].choice, ["codex", "antigravity", "rea"])
-        self.assertEqual(res.engine_used, "local-calibrated")
+        self.assertEqual(res.engine_used, "local-heuristic")
+        self.assertFalse(res.to_dict()['calibrated'])
 
     def test_decision_failover_when_usage_limit_hit(self):
         from backend.decision import Decision
@@ -206,7 +208,8 @@ class PolicyTests(unittest.TestCase):
         self.assertIsNotNone(failover)
         self.assertEqual(failover['selected_provider'], 'antigravity')
         self.assertIn("Alternância automática", failover['reason'])
-        self.assertGreater(failover['confidence'], 0.0)
+        self.assertIsNone(failover['confidence'])
+        self.assertEqual(failover['classification_method'], 'deterministic')
 
     def test_supervisor_automatic_failover_execution(self):
         with tempfile.TemporaryDirectory() as tmp:

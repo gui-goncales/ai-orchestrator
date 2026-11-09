@@ -12,7 +12,8 @@ export type Task = {
   created_at: string;
   updated_at: string;
   workflow?: string;
-  routing?: { reason?: string; category?: string };
+ spec?: { model?: string; mode_decision?: { requested_mode: string; selected_mode: string; decision_reason: string; permission_conflict?: boolean } };
+  routing?: { model?: string; model_reason?: string; reason?: string; category?: string };
   context_metrics?: {
     prompt_characters?: number;
     duplicates_removed?: string[];
@@ -45,6 +46,7 @@ export type Data = {
     name?: string;
     session_ready?: boolean;
     automatic_routing?: boolean;
+    models?: string[];
     config?: Record<string, string>;
   }[];
   events: { id: number; task_id: string | null; kind: string; payload: any; time: string }[];
@@ -80,6 +82,7 @@ export type Data = {
     };
   }[];
   task_steps?: { task_id: string; stage: string; output: string; time: string }[];
+ tool_actions?: { action_id: string; task_id: string; tool_name: string; status: string; turn_index: number; batch_index: number; created_at: string; updated_at: string; result?: unknown; error?: string }[];
   memory: { id: string; project_id: string; content: string; time: string; kind?: string }[];
 };
 

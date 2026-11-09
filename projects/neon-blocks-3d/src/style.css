@@ -1,0 +1,75 @@
+
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+:root{font-family:'DM Sans',sans-serif;color:#eaf4ff;background:#060a17;font-synthesis:none}
+*{box-sizing:border-box}
+body{margin:0;min-width:320px;background:radial-gradient(ellipse at 50% 35%,#142343 0%,#090f21 48%,#050914 100%);min-height:100vh}
+button{font:inherit;cursor:pointer}
+.shell{max-width:1330px;margin:auto;min-height:100vh;padding:0 35px;display:flex;flex-direction:column}
+.topbar{height:99px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #20304a}
+.brand{display:flex;align-items:center;gap:15px}
+.brand-icon{font-size:37px;color:#46dcff;text-shadow:0 0 25px #19cfff}
+.brand small{font-size:9px;letter-spacing:3px;color:#7792b5;font-weight:800}
+.brand h1{font-family:'Space Grotesk',sans-serif;font-size:23px;letter-spacing:1px;margin:2px 0;font-weight:700}
+.brand h1 em{font-style:normal;color:#49e0ff}
+.brand h1 span{font-size:11px;border:1px solid #387ca2;color:#7de5ff;border-radius:4px;padding:3px 5px;vertical-align:middle}
+.top-actions{display:flex;align-items:center;gap:12px}
+.mode-tag{font-size:10px;letter-spacing:1.5px;color:#65ddff;background:#10283c;border:1px solid #24516a;border-radius:6px;padding:12px 16px;font-weight:800}
+.icon-btn{height:39px;width:40px;background:#101c31;border:1px solid #2b3d5a;border-radius:7px;color:#b8d8f5;font-size:18px}
+.icon-btn:hover{background:#1b3854}
+.layout{flex:1;display:grid;grid-template-columns:minmax(170px,1fr) minmax(300px,530px) minmax(170px,1fr);gap:27px;padding:31px 0;align-items:start}
+.left,.right{display:flex;flex-direction:column;gap:17px;padding-top:35px}
+.panel{background:linear-gradient(145deg,rgba(19,33,57,.95),rgba(10,19,37,.95));border:1px solid #263b5a;border-radius:11px;box-shadow:0 10px 35px #0002}
+.panel-label{font-size:10px;letter-spacing:2px;color:#7898b9;font-weight:800;display:flex;justify-content:space-between}
+.panel-label span{color:#4bdcff}
+.hold-panel{height:176px;padding:20px;display:flex;flex-direction:column}
+.mini-piece{flex:1;display:flex;align-items:center;justify-content:center}
+.empty{font-size:11px;color:#415675;letter-spacing:2px}
+.panel-hint{font-size:9px;letter-spacing:2px;text-align:center;color:#52718d}
+.info-panel{padding:20px}
+.keyrow{display:flex;align-items:center;gap:5px;margin-top:15px}
+.keyrow span{margin-left:auto;font-size:9px;color:#718da9;letter-spacing:1px}
+kbd{font:600 11px 'DM Sans';min-width:26px;text-align:center;padding:6px 5px;border-radius:4px;border:1px solid #35506d;background:#172944;color:#b6eaff}
+.decorative{color:#426080;font-size:9px;letter-spacing:1.5px;text-align:center;margin-top:17px}
+.decorative span{color:#2db6e3}
+.game-area{min-width:0}
+.board-heading,.board-footer{display:flex;justify-content:space-between;align-items:center;font-size:10px;font-weight:800;letter-spacing:2px;color:#6e9dbd;padding:0 3px}
+.board-heading{height:34px}
+.live{font-size:9px;color:#43e5b1}
+#stage{height:min(67vh,670px);min-height:440px;border-radius:8px;overflow:hidden;border:1px solid #2b5a78;box-shadow:0 0 45px #05b9ff16,0 0 0 5px #0c1728;background:#080e22;touch-action:none}
+#stage canvas{display:block;width:100%;height:100%}
+.board-footer{height:37px;font-size:9px;color:#4f7799}
+.score-panel{padding:20px}
+.score-panel strong{display:block;font:700 clamp(27px,3vw,39px) 'Space Grotesk';letter-spacing:1px;margin:15px 0;color:#f2f9ff}
+.best{border-top:1px solid #243751;padding-top:13px;display:flex;justify-content:space-between;font-size:9px;letter-spacing:1px;color:#6886a5}
+.best span{color:#5fe5ff;font-weight:800}
+.stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.stat{padding:18px}
+.stat strong{display:block;font:700 29px 'Space Grotesk';margin-top:12px}
+.next-panel{padding:19px}
+.next-item{height:58px;border-bottom:1px solid #1c2e48;display:flex;align-items:center;gap:23px}
+.next-item:last-child{border:0}
+.next-item>span{font:700 10px 'Space Grotesk';color:#476681}
+.mini-grid{display:grid;grid-auto-rows:17px;gap:2px;justify-content:center;align-content:center}
+.mini-cell{width:17px;height:17px}
+.mini-cell.filled{background:var(--piece);border:1px solid #ffffff70;box-shadow:inset -3px -3px 6px #0006,inset 2px 2px 4px #fff8,0 0 10px var(--piece);border-radius:3px}
+.combo-panel{padding:17px 20px;display:flex;justify-content:space-between;align-items:center}
+.combo-panel strong{color:#5fe5ff;font:700 22px 'Space Grotesk'}
+.footer{height:58px;border-top:1px solid #1b2b43;display:flex;justify-content:space-between;align-items:center;font-size:9px;letter-spacing:1.5px;color:#52708d}
+.footer i{font-style:normal;color:#4fffc5}
+.overlay{position:fixed;inset:0;background:#030914bf;backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;z-index:5;padding:20px}
+.overlay.hidden{display:none}
+.modal{text-align:center;width:min(430px,100%);padding:38px 30px;background:linear-gradient(150deg,#142542,#080f20);border:1px solid #3a6385;border-radius:17px;box-shadow:0 0 100px #009dff22}
+.modal-symbol{font-size:57px;color:#4be3ff;text-shadow:0 0 32px #00bfff;margin-bottom:14px}
+.modal small{color:#60d7fa;letter-spacing:4px;font-size:10px;font-weight:800}
+.modal h2{font:700 51px/1.06 'Space Grotesk';letter-spacing:-2px;margin:21px 0}
+.modal h2 span{color:#56dfff}
+.modal p{color:#91a8c5;font-size:14px;line-height:1.8;margin-bottom:27px}
+.primary{border:0;background:linear-gradient(100deg,#13b9e9,#5be6ff);color:#041225;font-weight:800;letter-spacing:1.5px;padding:18px 24px;border-radius:7px;width:100%;display:flex;justify-content:space-between}
+.primary:hover{filter:brightness(1.13)}
+.modal-foot{margin-top:19px;color:#5e7795;letter-spacing:2px;font-size:9px}
+#toast{position:fixed;left:50%;top:43%;transform:translate(-50%,-50%) scale(.8);font:700 28px 'Space Grotesk';color:#6cf1ff;text-shadow:0 0 35px #19cfff;opacity:0;pointer-events:none;transition:.2s;z-index:3;white-space:nowrap}
+#toast.show{opacity:1;transform:translate(-50%,-50%) scale(1)}
+.touch-controls{display:none}
+@media(max-width:950px){.shell{padding:0 17px}.layout{gap:12px;grid-template-columns:135px minmax(270px,1fr) 145px}.left,.right{gap:10px}.panel{border-radius:8px}.hold-panel,.info-panel,.score-panel,.next-panel{padding:13px}.score-panel strong{font-size:24px}.stat{padding:12px}.stat strong{font-size:22px}.next-item{height:48px}.mode-tag{display:none}}
+@media(max-width:680px){.shell{padding:0 12px}.topbar{height:68px}.brand-icon{font-size:25px}.brand small{font-size:7px;letter-spacing:1px}.brand h1{font-size:16px}.brand h1 span{font-size:8px}.top-actions{gap:6px}.icon-btn{height:33px;width:33px}.layout{padding:12px 0 5px;display:grid;grid-template-columns:80px minmax(0,1fr) 86px;gap:7px}.left,.right{padding-top:28px;gap:7px}.panel-label{font-size:8px;letter-spacing:1px}.hold-panel{height:112px;padding:8px}.panel-hint{font-size:7px}.info-panel,.decorative,.combo-panel{display:none}.score-panel{padding:8px}.score-panel strong{font-size:clamp(12px,3vw,19px);margin:9px 0;letter-spacing:0}.best{font-size:7px;display:block}.best span{display:block;margin-top:5px}.stat-grid{grid-template-columns:1fr;gap:7px}.stat{padding:8px}.stat strong{font-size:19px;margin-top:5px}.next-panel{padding:8px}.next-item{height:44px;gap:5px}.next-item>span{font-size:7px}.mini-grid{grid-auto-rows:11px;gap:1px;grid-template-columns:repeat(4,11px)!important}.mini-cell{width:11px;height:11px}.board-heading,.board-footer{font-size:7px;letter-spacing:0}.live{font-size:7px}#stage{height:min(64vh,590px);min-height:340px}.touch-controls{display:grid;grid-template-columns:repeat(6,1fr);gap:7px;padding:10px 0 18px}.touch-controls button{height:49px;border:1px solid #326383;border-radius:8px;background:#142a46;color:#78eaff;font-weight:800;font-size:12px;touch-action:none}.touch-controls button:active{background:#1f6a88}.footer{height:35px;font-size:7px}.footer span:last-child{display:none}}
+@media(max-width:390px){.layout{grid-template-columns:65px minmax(0,1fr) 72px;gap:5px}.panel-label{font-size:7px}.next-item>span{display:none}.brand h1{font-size:13px}.brand{gap:6px}}

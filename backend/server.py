@@ -10,22 +10,36 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 from backend.core import Store, Supervisor, now, handoff
+from backend.operational_health import ProcessIdentity
+from backend.business_work_http import BusinessWorkHTTP
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def serve(port=8787, data=None, adapter=None):
-    store = Store(data or ROOT/'data'/'orchestrator.sqlite3', ROOT)
-    supervisor = Supervisor(store, adapter)
-    # Refuse a second backend for the same DB (POSIX local target).
     import fcntl
-    lease = open(store.path+'.lock', 'w')
+    db_path = Path(data or ROOT/'data'/'orchestrator.sqlite3').expanduser().resolve()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    lease = open(str(db_path)+'.lock', 'a+')
     try:
         fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    except (BlockingIOError, OSError):
+        lease.close()
         raise SystemExit('Outro backend já utiliza este banco.')
-    store.recover()
-    origin = 'http://127.0.0.1:'+str(port)
+    try:
+        identity = ProcessIdentity(ROOT)
+        store = Store(db_path, ROOT)
+        supervisor = Supervisor(store, adapter)
+        from backend.attachments import AttachmentStore
+        attachments = AttachmentStore(store)
+        business_http = BusinessWorkHTTP(db_path, supervisor)
+        from backend.workspace_folders import WorkspaceFolders
+        workspace_folders = WorkspaceFolders(store)
+        store.recover()
+    except BaseException:
+        lease.close()
+        raise
+    origin = 'http://' + '127.0.0.1:' + str(port)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -48,11 +62,48 @@ def serve(port=8787, data=None, adapter=None):
             if not self.headers_ok():
                 return self.send({'error': 'Origem não autorizada'}, 403)
             path = urlparse(self.path).path
+            if path.startswith('/api/attachments/'):
+                identifier = path.rsplit('/', 1)[-1]
+                try:
+                    meta, raw = attachments.read(identifier)
+                except (ValueError, OSError):
+                    return self.send({'error': 'Anexo não encontrado'}, 404)
+                mime = mimetypes.guess_type(meta['name'])[0] or 'application/octet-stream'
+                if meta['extension'] == 'svg':
+                    mime = 'application/octet-stream'
+                self.send_response(200)
+                self.send_header('Content-Type', mime)
+                self.send_header('Content-Disposition', 'inline' if meta['extension'] in ('png','jpg','jpeg','webp','gif') else 'attachment')
+                self.send_header('Content-Length', str(len(raw)))
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            if path == '/api/workspace/folders':
+                return self.send(workspace_folders.bindings())
+            if path.startswith('/api/business/'):
+                try:
+                    result = business_http.get(self.path)
+                    if isinstance(result, tuple) and result[0] == 'docx':
+                        filename, raw = result[1]
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+                        self.send_header('Content-Disposition', 'attachment; filename=' + chr(34) + filename + chr(34))
+                        self.send_header('Content-Length', str(len(raw)))
+                        self.send_header('Cache-Control', 'no-store')
+                        self.send_header('X-Content-Type-Options', 'nosniff')
+                        self.end_headers()
+                        self.wfile.write(raw)
+                        return
+                    return self.send(result)
+                except ValueError as exc:
+                    return self.send({'error': str(exc)}, 400)
             if path == '/api/browser-bridge/next':
                 from backend.browser_bridge import bridge
                 return self.send({'job': bridge.next_job()})
             if path == '/api/health':
-                return self.send({'app':'ai-orchestrator','status':'online','pid':os.getpid(),'time':now()})
+                return self.send({'app':'ai-orchestrator','status':'online','pid':os.getpid(),'time':now(), **identity.diagnose(db_path)})
             if path == '/api/state':
                 return self.send({**store.snapshot(), 'providers': supervisor.providers(), 'server_time': now()})
             if path.startswith('/api/reviews/') and '/evidence/' in path:
@@ -120,19 +171,52 @@ def serve(port=8787, data=None, adapter=None):
             self.send_header('Content-Length', str(len(raw)))
             self.send_header('Cache-Control', 'no-cache')
             self.send_header('X-Content-Type-Options', 'nosniff')
-            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
             self.end_headers()
             self.wfile.write(raw)
 
         def do_POST(self):
+            if self.path == '/api/attachments' and self.headers_ok():
+                try:
+                    from backend.attachments import MAX_FILE
+                    size = int(self.headers.get('Content-Length',0))
+                    if size <= 0 or size > MAX_FILE + 1048576:
+                        raise ValueError('Upload excede o limite permitido')
+                    ctype = self.headers.get('Content-Type','')
+                    if ctype.split(';', 1)[0].strip().lower() != 'multipart/form-data' or 'boundary=' not in ctype.lower():
+                        raise ValueError('Envie multipart/form-data')
+                    from email.parser import BytesParser
+                    from email.policy import default
+                    prefix = b'Content-Type: ' + ctype.encode('ascii') + bytes([13,10]) + b'MIME-Version: 1.0' + bytes([13,10,13,10])
+                    message = BytesParser(policy=default).parsebytes(prefix + self.rfile.read(size))
+                    parts = list(message.iter_parts())
+                    if len(parts) != 1 or parts[0].get_param('name',header='content-disposition') != 'file':
+                        raise ValueError('Envie exatamente um arquivo por requisição')
+                    filename = parts[0].get_filename()
+                    if not filename:
+                        raise ValueError('Nome de arquivo obrigatório')
+                    return self.send(attachments.put(filename,parts[0].get_payload(decode=True)),201)
+                except (ValueError,UnicodeError) as exc:
+                    return self.send({'error':str(exc)},400)
             if not self.headers_ok() or self.headers.get('Content-Type') != 'application/json':
                 return self.send({'error': 'Origem ou tipo inválido'}, 403)
             try:
                 size = int(self.headers.get('Content-Length', 0))
-                if size <= 0 or size > 64000:
+                limit = 12000000 if urlparse(self.path).path.startswith('/api/business/contexts/') and urlparse(self.path).path.endswith('/sources') else 64000
+                if size <= 0 or size > limit:
                     raise ValueError('Corpo inválido')
                 body = json.loads(self.rfile.read(size))
                 path = urlparse(self.path).path
+                if path == '/api/workspace/pick-directory':
+                    from backend.directory_picker import choose_directory
+                    return self.send(choose_directory())
+                if path == '/api/workspace/browse-directory':
+                    from backend.directory_browser import browse_directory
+                    return self.send(browse_directory(body.get('path', '')))
+                if path == '/api/workspace/folders':
+                    return self.send(workspace_folders.bind(body))
+                if path.startswith('/api/business/'):
+                    return self.send(business_http.post(path, body), 201)
                 if path.startswith('/api/browser-bridge/') and path.endswith('/result'):
                     from backend.browser_bridge import bridge
                     job_id = path.split('/')[3]
@@ -150,10 +234,17 @@ def serve(port=8787, data=None, adapter=None):
                         if not project:
                             raise ValueError('Projeto não encontrado')
                         ReaAdapter.target(body.get('spec') or {}, project[0])
-                    id = store.create(body.get('objective', ''), body.get('project_id', 'local'), body.get('provider', 'auto'), self.headers.get('Idempotency-Key'), body.get('workflow', 'direct'), body.get('spec'))
+                    id = store.create(body.get('objective', ''), body.get('project_id', 'local'), body.get('provider', 'auto'), self.headers.get('Idempotency-Key'), body.get('workflow', 'direct'), body.get('spec'), body.get('attachment_ids'))
                     return self.send({'id': id}, 201)
                 if path.startswith('/api/tasks/'):
                     _, _, _, id, action = path.split('/')
+                    if action == 'authorize-retry':
+                        action_id = body.get('action_id')
+                        if not isinstance(action_id, str) or not action_id:
+                            raise ValueError('Identificador da ação obrigatório')
+                        if store.task(id)['status'] in ('running', 'queued'):
+                            raise ValueError('Aguarde a tarefa parar antes de autorizar')
+                        return self.send(store.authorize_uncertain_retry(id, action_id))
                     if action == 'delete':
                         return self.send(store.delete_conversation(id))
                     if action == 'cancel':
@@ -229,9 +320,15 @@ def serve(port=8787, data=None, adapter=None):
             except (ValueError, TypeError, AttributeError, KeyError) as e:
                 return self.send({'error': str(e)}, 400)
 
-    from backend.artifacts import start_preview
-    preview=start_preview() if port==8787 else None
-    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    try:
+        from backend.artifacts import start_preview
+        server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+        preview = start_preview() if port == 8787 else None
+    except BaseException:
+        if 'server' in locals():
+            server.server_close()
+        lease.close()
+        raise
     threading.Thread(target=supervisor.loop, daemon=True).start()
     connection_stop = threading.Event()
     if adapter is None:

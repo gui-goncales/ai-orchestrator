@@ -18,6 +18,60 @@ class AgentEngineTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+
+        calls = []
+        answers = iter(['1220\n680154\n190160\n500130\n1220',
+            '<tool_call name="write_file">{"path":"fix.py","content":"pass"}</tool_call>'
+            '<tool_call name="run_command">' + json.dumps({'command': [sys.executable, '-c', 'print("ok")']}) + '</tool_call>'
+            '<tool_call name="finish">{"summary":"Correção validada"}</tool_call>'])
+        def model(messages, *args):
+            calls.append(list(messages))
+            return next(answers), {}
+        result = AgentRunner(self.tools).run(model, 'Implemente a correção e execute testes.',
+                                            lambda *args: None, threading.Event())
+        self.assertEqual(result['status'], 'completed')
+        self.assertIn('<tool_call name="read_file">', calls[1][-1]['content'])
+        self.assertIn('Implemente a correção', calls[1][-1]['content'])
+
+    def test_unrecognized_invoke_never_completes(self):
+        events = []
+        response = chr(60) + 'invoke name="write_file">{"path":"pending.py"}</invoke>'
+        result = AgentRunner(self.tools).run(
+            lambda *args: (response, {}),
+            'Implemente a alteração e execute testes.',
+            lambda kind, data: events.append(kind), threading.Event())
+        self.assertNotEqual(result['status'], 'completed')
+        self.assertFalse((self.root / 'pending.py').exists())
+        self.assertEqual(events.count('invalid_tool_protocol'), 2)
+
+    def test_repeated_numeric_response_stops_without_finish_rejection_loop(self):
+        events = []
+        result = AgentRunner(self.tools).run(lambda *args: ('1220\n680154', {}),
+            'Implemente a correção e execute testes.',
+            lambda kind, data: events.append(kind), threading.Event())
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn('apenas numérica', result['error'])
+        self.assertEqual(events.count('invalid_response'), 2)
+        self.assertNotIn('completion_rejected', events)
+
+    def test_numeric_answer_is_valid_for_simple_question(self):
+        result = AgentRunner(self.tools).run(lambda *args: ('42', {}),
+            'Quanto é 6 vezes 7?', lambda *args: None, threading.Event())
+        self.assertEqual(result['status'], 'completed')
+
+    def test_long_objective_remains_inline_after_tool_result(self):
+        calls = []
+        answers = iter(['<tool_call name="list_dir">{"path":"."}</tool_call>', 'Análise concluída.'])
+        def model(messages, *args):
+            calls.append(list(messages))
+            return next(answers), {}
+        result = AgentRunner(WorkspaceTools(str(self.root), read_only=True)).run(model,
+            'Analise a retomada de tarefas. ' + 'Contexto adicional. ' * 200,
+            lambda *args: None, threading.Event())
+        self.assertEqual(result['status'], 'completed')
+        self.assertIn('Analise a retomada de tarefas.', calls[1][-1]['content'])
+        self.assertIn('Cópia integral', calls[1][-1]['content'])
+
     def test_recovers_objective_after_reading_instead_of_completing(self):
         tools = WorkspaceTools(str(self.root), read_only=True)
         (self.root / 'decision.py').write_text('class Decision: pass')
@@ -58,6 +112,10 @@ class AgentEngineTests(unittest.TestCase):
         result = self.tools.run_command([sys.executable, '-c', 'print("x"*70000)'])
         self.assertTrue(result['truncated'])
         self.assertLessEqual(len(result['stdout']), 65536)
+        self.assertIn('TRUNCADO', result['stdout'])
+        saved = list((self.root / '.orchestrator-results').glob('*.txt'))
+        self.assertEqual(saved[0].read_text(), 'x' * 70000 + '\n')
+        self.assertIn('x', self.tools.read_file(str(saved[0].relative_to(self.root)))['content'])
 
     def test_commands_respect_readonly_cwd_and_cancel(self):
         tools = WorkspaceTools(str(self.root), read_only=True)
@@ -134,8 +192,8 @@ class AgentEngineTests(unittest.TestCase):
         class Adapter:
             def chat_turn(inner, messages, *args):
                 self.assertIn(str(self.root), messages[1]['content'])
-                self.assertIn('run_command', messages[1]['content'])
-                self.assertIn('write_file', messages[1]['content'])
+                self.assertIn('run_command', messages[0]['content'])
+                self.assertIn('write_file', messages[0]['content'])
                 self.assertIn('PROTOCOLO LOCAL WORK', messages[1]['content'])
                 return 'Configuração recebida.', {}
         result = run_universal_agent(Adapter(), 'Responda sobre as capacidades.', str(self.root),
@@ -240,8 +298,11 @@ class AgentEngineTests(unittest.TestCase):
                 str(self.root), lambda k, d: events.append((k, d)), threading.Event())
             self.assertEqual(result['status'], 'completed')
             self.assertIn('INITIAL_OBJECTIVE_MARKER', prompts[0])
+            self.assertEqual(prompts[0].count('COMO EXECUTAR AÇÕES:'), 1)
             self.assertIn('unique-file-evidence', prompts[2])
             self.assertEqual('[SYSTEM]' in prompts[1], not stateful)
+            self.assertEqual(prompts[1].endswith('[ASSISTANT]:'), not stateful)
+            self.assertEqual('[USER]\n' in prompts[1], not stateful)
             self.assertEqual('COMO EXECUTAR AÇÕES:' in prompts[2], not stateful)
             self.assertEqual('<tool_result name="list_dir">' in prompts[2], not stateful)
             self.assertEqual([d['incremental'] for k, d in events if k == 'model_input'],
@@ -256,6 +317,41 @@ class AgentEngineTests(unittest.TestCase):
             'Verifique acesso de leitura.', lambda kind, data: events.append((kind, data)), threading.Event())
         self.assertEqual(result['status'], 'completed')
         self.assertTrue(any(kind == 'workspace_access_recovery' for kind, _ in events))
+
+    def test_conditional_repair_does_not_require_mutating_validation_task(self):
+        from backend.agent_engine import completion_requirements
+        prompt = ('Dê continuidade à validação da integração. Execute os testes locais e o build.\n'
+                  'Se precisar corrigir o código, valide com fixtures antes de ativar as alterações.')
+        self.assertEqual(completion_requirements(prompt, False), {'mutation': False, 'command': True})
+        answers = iter(['<tool_call name="run_command">{"command":["' + sys.executable + '","-c","print(1)"]}</tool_call>',
+                        '<tool_call name="finish">{"summary":"Validação concluída sem necessidade de alteração."}</tool_call>'])
+        result = AgentRunner(self.tools).run(lambda *args: (next(answers), {}), prompt,
+                                            lambda *args: None, threading.Event())
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['files_mutated'], [])
+
+    def test_reference_names_are_not_mutation_requests(self):
+        from backend.agent_engine import completion_requirements
+        for reference in ('docs/chatgpt-context-fix.md', 'fix.py', 'backend/write.py',
+                          'create/', 'https://example.com/fix'):
+            with self.subTest(reference=reference):
+                prompt = 'Leia ' + reference + ' e investigue. Execute os testes e o build.'
+                self.assertEqual(completion_requirements(prompt, False), {'mutation': False, 'command': True})
+        self.assertEqual(completion_requirements('Corrija backend/fix.py. Execute tests/test_core.py.', False),
+                         {'mutation': True, 'command': True})
+        self.assertTrue(completion_requirements('Fix the issue described in docs/context-fix.md.', False)['mutation'])
+
+    def test_review_of_context_fix_document_can_finish_without_editing(self):
+        answers = iter(['<tool_call name="run_command">' + json.dumps({
+            'command': [sys.executable, '-c', 'print("fixture validated")']}) + '</tool_call>',
+            '<tool_call name="finish">{"summary":"Revisão concluída, sem correções necessárias."}</tool_call>'])
+        events = []
+        result = AgentRunner(self.tools).run(lambda *args: (next(answers), {}),
+            'Leia docs/chatgpt-context-fix.md e revise as evidências. Execute os testes e o build.',
+            lambda k, d: events.append((k, d)), threading.Event())
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['files_mutated'], [])
+        self.assertFalse(any(k == 'completion_rejected' for k, _ in events))
 
     def test_validation_before_mutation_cannot_prove_completion(self):
         answers = iter([
@@ -440,7 +536,8 @@ class WorkspaceRegressionTests(unittest.TestCase):
             result = AgentRunner(tools, max_turns=1).run(
                 lambda *args: ('<tool_call name="list_dir"><path>.</path></tool_call>', {}),
                 'inspect', lambda *args: None, threading.Event())
-            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['status'], 'interrupted')
+            self.assertIn('Limite de rodadas', result['error'])
 
     def test_supervisor_work_writes_linked_project(self):
         from backend.core import Store, Supervisor

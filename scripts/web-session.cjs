@@ -46,8 +46,8 @@ async function run(data){
  const origin=new URL(c.chat_url).origin;
  const pages=browser.contexts().flatMap(ctx=>ctx.pages()).filter(p=>{try{return new URL(p.url()).origin===origin}catch{return false}});
  // Prefer the configured conversation; never navigate an existing tab or select a different account.
- let page=pages.find(p=>p.url()===c.chat_url);
- if(!page && pages.length===1)page=pages[0];
+ let page=data.context ? pages.find(p=>p.url().split(/[?#]/)[0]===data.context.url) : pages.find(p=>p.url()===c.chat_url);
+ if(!data.context && !page && pages.length===1)page=pages[0];
  if(!page)return {status:'session_closed',reason:'conversation_missing',session_ready:false,controls_mapped:false,result:'',usage:{},error:'Abra uma única conversa no navegador dedicado. O login pode estar salvo, mas a conversa não está aberta.'};
  if(data.action!=='check')await page.bringToFront();
  const suggested=data.action==='check'?await discover(page,c):{};
@@ -68,31 +68,63 @@ async function run(data){
  if(await page.locator(c.busy_selector).filter({visible:true}).count())return {status:'failed',result:'',usage:{},error:'A conversa já está gerando uma resposta.'};
  const responses=page.locator(c.response_selector);
  const before=await responses.count();
+ const responseId=async()=>await responses.count() ? responses.last().evaluate(el=>el.closest('[data-chatgpt-selection-message-id]')?.getAttribute('data-chatgpt-selection-message-id') || el.closest('[data-message-id]')?.getAttribute('data-message-id') || null) : null;
+ const beforeId=await responseId();
+ const documentToken=await page.evaluate(()=>globalThis.__orchestratorDocumentToken ||= String(Date.now())+Math.random());
+ let initialURL=page.url().split(/[?#]/)[0];
+ if(data.context && ((data.context.assistant_id ? beforeId!==data.context.assistant_id : before!==data.context.count) || documentToken!==data.context.document_token))return {status:'interrupted',reason:'conversation_changed',result:'',usage:{},error:'Contexto da conversa alterado; execução interrompida.'};
  await input.fill(data.prompt);
  if(c.send_selector){
   const send=await visible(page,c.send_selector);
   if(!send||!await send.isEnabled())return {status:'failed',result:'',usage:{},error:'Envio indisponível. O rascunho foi preservado.'};
   await send.click();
  }else await input.press('Enter');
- let submitted=false,last='',stableSince=0,sawBusy=false;
+ let submitted=null,last='',stableSince=0,sawBusy=false,lastBusy=false;
  const deadline=Date.now()+data.timeout_ms;
  while(Date.now()<deadline){
   await page.waitForTimeout(500);
-  if(new URL(page.url()).origin!==origin)return {status:'authentication_required',submitted,result:'',usage:{},error:'Sessão redirecionada; confira o envio antes de retomar.'};
+  const currentURL=page.url().split(/[?#]/)[0];
+  if(currentURL!==initialURL) {
+   const previous=new URL(initialURL), current=new URL(currentURL);
+   const oldPath=decodeURIComponent(previous.pathname), newPath=decodeURIComponent(current.pathname);
+   const provisional=value=>/^\/c\/local-chatgpt:[a-f0-9-]+$/i.test(value);
+   const persisted=value=>/^\/c\/[a-f0-9]{8}-[a-f0-9-]{27}$/i.test(value);
+   const normalize=value=>value.replace(/\s+/g,' ').trim();
+   const users=page.locator('[data-message-author-role="user"], [data-user-message-bubble] .whitespace-pre-wrap');
+   const echo=await users.count() ? await users.last().innerText() : '';
+   // ChatGPT's collapsed user message exposes the first 10,240 characters.
+   // Accept only this exact boundary, never an arbitrary prompt prefix.
+   const echoMatches=normalize(echo)===normalize(data.prompt) ||
+     (echo.length===10240 && data.prompt.length>10240 &&
+      normalize(echo)===normalize(data.prompt.slice(0,10240)));
+   const sameDocument=await page.evaluate(()=>globalThis.__orchestratorDocumentToken);
+   const promotion=origin==='https://chatgpt.com' && current.origin===origin &&
+     sameDocument===documentToken &&
+     ((oldPath==='/' && !data.context && before===0 && (provisional(newPath)||persisted(newPath))) ||
+      (provisional(oldPath)&&persisted(newPath))) && echoMatches;
+   if(!promotion)return {status:'interrupted',reason:'conversation_changed',submitted,result:'',usage:{},error:'Sessão redirecionada; confira o envio antes de retomar.'};
+   initialURL=currentURL;
+   submitted=true;
+  }
   const busy=await page.locator(c.busy_selector).filter({visible:true}).count()>0;
   sawBusy ||= busy;
+  lastBusy=busy;
+  if(busy) submitted=true;
   const count=await responses.count();
-  if(count<=before)continue;
+  const latestId=await responseId();
+  if(!count || (latestId ? latestId===beforeId : count<=before))continue;
   submitted=true;
   const text=(await responses.last().innerText()).trim();
   if(text!==last){last=text;stableSince=Date.now()}
-  // Stability alone never confirms completion: the configured busy control must have appeared then disappeared.
-  if(text&&sawBusy&&!busy&&Date.now()-stableSince>=2000)return {status:'completed',submitted:true,result:text,usage:{}};
+  // ChatGPT needs a final-turn action control as well as idle generation and stable text.
+  const finalControl=await responses.last().evaluate(el=>el.closest('[data-talvt-turn-state]')?.getAttribute('data-talvt-turn-state')==='complete'||!!el.closest('article')?.querySelector('[data-testid="copy-turn-action-button"], [data-testid="good-response-turn-action-button"]'));
+  if(Buffer.byteLength(text,'utf8')>48000)return {status:'interrupted',reason:'response_limit',submitted,result:'',usage:{},error:'Resposta excedeu 48 KiB; consulte a conversa. Nenhum texto parcial foi executado.'};
+  if(text&&(origin==='https://chatgpt.com'?finalControl:sawBusy)&&!busy&&Date.now()-stableSince>=2000)return {status:'completed',reason:'response_complete',submitted:true,result:text,usage:{},context:{assistant_id:latestId,document_token:documentToken,url:page.url().split(/[?#]/)[0],count}};
  }
- return {status:'interrupted',submitted,result:'',usage:{},error:'Conclusão não confirmada. Confira a conversa; retomar pode duplicar a mensagem.'};
+ return {status:'interrupted',reason:lastBusy?'provider_timeout':'capture_timeout',submitted,result:'',usage:{},error:lastBusy?'Tempo limite do provedor: continua gerando. Não reenvie.':'Falha de captura: término não confirmado. Confira a conversa antes de retomar.'};
 }
 module.exports={run,inspect,visible,discover};
 if(require.main===module){let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',async()=>{
  try{process.stdout.write(JSON.stringify(await run(JSON.parse(raw))),()=>process.exit(0))}
- catch{process.stdout.write(JSON.stringify({status:'failed',result:'',usage:{},error:'Sessão indisponível ou controles alterados. Verifique login e mapeamento antes de repetir.'}),()=>process.exit(1))}
+ catch{process.stdout.write(JSON.stringify({status:'interrupted',reason:'capture_failed',submitted:null,result:'',usage:{},error:'Sessão indisponível ou controles alterados. Verifique login e mapeamento antes de repetir.'}),()=>process.exit(1))}
 })}

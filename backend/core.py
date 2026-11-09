@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 import signal
 import shutil
 import sqlite3
@@ -15,6 +16,7 @@ from backend.web_providers import WebAdapter, DEFAULT_TESS, validate as validate
 from backend.policy import choose, build_context, validate_output
 from backend.integrations import GeminiAdapter, ReaAdapter, AntigravityAdapter, REA_STAGES
 from backend.decision import Decision
+from backend.api_providers import ApiAdapter
 
 
 def load_env():
@@ -61,13 +63,22 @@ def classify_error(event):
 
 
 def handoff(task):
-    return {'version': 1, 'task_id': task['id'], 'objective': task['objective'],
-            'constraints': ['Somente leitura. Não alterar arquivos.', 'Não repetir trabalho confirmado.'],
-            'state': task['status'], 'confirmed_result': task.get('result', ''),
-            'known_error': task.get('error'), 'files': [], 'decisions': [], 'tests': [],
-            'next_action': 'Continuar apenas pendências; verificar resultado já confirmado.',
-            'provider': task['provider'], 'workflow': task.get('workflow', 'direct'), 'created_at': now()}
-
+    spec = task.get("spec") or {}
+    if isinstance(spec, str):
+        spec = json.loads(spec)
+    decision = spec.get("mode_decision") or Decision.classify_mode(task["objective"], {"work":"work","direct":"analyze","rea":"plan","deliver":"artifact"}.get(task.get("workflow"),"analyze"))
+    allowed = decision.get("permitted_operations", [])
+    constraints = ["Não repetir trabalho confirmado."]
+    if "write" not in allowed:
+        constraints.append("Somente leitura. Não alterar arquivos.")
+    if "execute" not in allowed:
+        constraints.append("Não executar comandos.")
+    return {"version": 1, "task_id": task["id"], "objective": task["objective"],
+            "constraints": constraints, "mode_decision": decision,
+            "state": task["status"], "confirmed_result": task.get("result", ""),
+            "known_error": task.get("error"), "files": [], "decisions": [], "tests": [],
+            "next_action": "Continuar apenas pendências; verificar resultado já confirmado.",
+            "provider": task["provider"], "workflow": task.get("workflow", "direct"), "created_at": now()}
 
 class Store:
     def __init__(self, path, root):
@@ -89,6 +100,17 @@ class Store:
             db.execute("CREATE TABLE IF NOT EXISTS visual_reviews(task_id TEXT PRIMARY KEY,parent_id TEXT,capture TEXT DEFAULT '{}',report TEXT DEFAULT '',time TEXT)")
             db.execute('CREATE TABLE IF NOT EXISTS artifacts(task_id TEXT PRIMARY KEY, path TEXT, manifest TEXT, time TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS task_steps(task_id TEXT, stage TEXT, output TEXT, time TEXT, PRIMARY KEY(task_id,stage))')
+            db.execute('CREATE TABLE IF NOT EXISTS execution_states(task_id TEXT PRIMARY KEY, version INTEGER NOT NULL, execution_id TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL)')
+            db.execute('''CREATE TABLE IF NOT EXISTS tool_actions(
+            action_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, execution_id TEXT NOT NULL,
+            turn_index INTEGER NOT NULL, batch_index INTEGER NOT NULL,
+            tool_name TEXT NOT NULL, arguments TEXT NOT NULL, status TEXT NOT NULL,
+            result TEXT, before_hash TEXT, after_hash TEXT, error TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_tool_actions_task ON tool_actions(task_id,turn_index,batch_index)')
+            action_columns = {r[1] for r in db.execute('PRAGMA table_info(tool_actions)')}
+            if 'evidence' not in action_columns:
+                db.execute('ALTER TABLE tool_actions ADD COLUMN evidence TEXT')
             columns = {r[1] for r in db.execute('PRAGMA table_info(tasks)')}
             for name, default in [('workflow', 'direct'), ('spec', '{}'), ('requested_provider', ''), ('routing', '{}'), ('context_metrics', '{}'), ('validation', '{}'), ('quality', 'unreviewed')]:
                 if name not in columns:
@@ -96,6 +118,7 @@ class Store:
             memory_columns = {r[1] for r in db.execute('PRAGMA table_info(memory)')}
             if 'kind' not in memory_columns:
                 db.execute("ALTER TABLE memory ADD COLUMN kind TEXT DEFAULT 'constraint'")
+            db.execute('CREATE TABLE IF NOT EXISTS chat_attachments (id TEXT PRIMARY KEY,task_id TEXT,name TEXT NOT NULL,extension TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
             db.execute('INSERT OR IGNORE INTO projects VALUES(?,?,?)', ('local', 'AI Orchestrator', self.root))
 
     def connect(self):
@@ -123,6 +146,74 @@ class Store:
                    (task['id'], json.dumps(p, ensure_ascii=False), now()))
         self.event(db, task['id'], 'checkpoint', {'version': 1, 'state': task['status']})
 
+    def save_execution_state(self, task_id, state):
+        """Durably save a versioned agent checkpoint, scoped to one task."""
+        execution_id = str(state.get('execution_id') or uuid.uuid4().hex)
+        payload = dict(state, version=1, execution_id=execution_id, task_id=task_id)
+        with self.connect() as db:
+            db.execute('''INSERT INTO execution_states(task_id,version,execution_id,state,updated_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET
+                version=excluded.version,execution_id=excluded.execution_id,
+                state=excluded.state,updated_at=excluded.updated_at''',
+                (task_id, 1, execution_id, json.dumps(payload, ensure_ascii=False), now()))
+        return payload
+
+    def load_execution_state(self, task_id):
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM execution_states WHERE task_id=?', (task_id,)).fetchone()
+        if not row:
+            return None
+        try:
+            state = json.loads(row['state'])
+            if state.get('version') != 1 or state.get('task_id') != task_id:
+                return None
+            return state
+        except (ValueError, TypeError):
+            return None
+
+    def action_intent(self, task_id, execution_id, action_id, turn_index, batch_index, name, args):
+        """Persist intent before dispatch; IDs are invocation IDs, not argument hashes."""
+        timestamp = now()
+        with self.connect() as db:
+            db.execute('''INSERT OR IGNORE INTO tool_actions
+                (action_id,task_id,execution_id,turn_index,batch_index,tool_name,arguments,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,'prepared',?,?)''',
+                (action_id, task_id, execution_id, turn_index, batch_index, name,
+                json.dumps(args, ensure_ascii=False), timestamp, timestamp))
+            row = db.execute('SELECT * FROM tool_actions WHERE action_id=?', (action_id,)).fetchone()
+            if row['task_id'] != task_id or row['execution_id'] != execution_id:
+                raise ValueError('Ação pertence a outra execução')
+            if row['status'] == 'running':
+                db.execute("UPDATE tool_actions SET status=?,updated_at=? WHERE action_id=?", ("uncertain", timestamp, action_id))
+                return dict(db.execute('SELECT * FROM tool_actions WHERE action_id=?', (action_id,)).fetchone())
+            if row['status'] in ('completed', 'failed', 'uncertain'):
+                return dict(row)
+            db.execute("UPDATE tool_actions SET status='running',updated_at=? WHERE action_id=?",
+                (timestamp, action_id))
+            return dict(db.execute('SELECT * FROM tool_actions WHERE action_id=?', (action_id,)).fetchone())
+
+    def action_before_hash(self, action_id, before_hash):
+        with self.connect() as db:
+            db.execute("UPDATE tool_actions SET before_hash=?,updated_at=? WHERE action_id=? AND status='running'",
+                       (before_hash, now(), action_id))
+
+    def action_result(self, action_id, status, result=None, before_hash=None, after_hash=None, error=None, evidence=None):
+        """Commit result and evidence (e.g. file hashes when a command really ran) in one UPDATE."""
+        if status not in ('completed', 'failed', 'uncertain'):
+            raise ValueError('Estado de ação inválido')
+        with self.connect() as db:
+            db.execute('''UPDATE tool_actions SET status=?,result=?,before_hash=COALESCE(?,before_hash),
+                after_hash=COALESCE(?,after_hash),error=?,evidence=?,updated_at=? WHERE action_id=?''',
+                (status, json.dumps(result, ensure_ascii=False) if result is not None else None,
+                before_hash, after_hash, error, json.dumps(evidence, ensure_ascii=False) if evidence is not None else None, now(), action_id))
+
+    def uncertain_actions(self, task_id):
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM tool_actions WHERE task_id=? AND status IN ('running','uncertain') ORDER BY turn_index,batch_index",
+                (task_id,)).fetchall()
+        return [dict(r) for r in rows]
+
     def execution_evidence(self, db, task_id):
         changes = []
         commands = []
@@ -138,20 +229,26 @@ class Store:
         return {'source': 'runtime_tool_results', 'files_changed': changes, 'commands': commands,
                 'scope': 'Evidências históricas; inspecione os arquivos para confirmar o estado atual.'}
 
-    def create(self, objective, project, provider, key, workflow="direct", spec=None):
-        objective = objective.strip()
+    def create(self, objective, project, provider, key, workflow="direct", spec=None, attachment_ids=None):
+        attachment_ids = attachment_ids or []
+        from backend.attachments import MAX_FILES
+        if not isinstance(attachment_ids,list) or len(attachment_ids)>MAX_FILES or any(not isinstance(x,str) for x in attachment_ids) or len(set(attachment_ids))!=len(attachment_ids):
+            raise ValueError('Lista de anexos inválida')
+        objective = objective.strip() or ('Analise os arquivos anexados.' if attachment_ids else '')
         with self.connect() as db:
-            known_provider = provider in ('auto', 'codex', 'gemini', 'antigravity', 'rea', 'web-tess', 'tess') or bool(db.execute('SELECT id FROM web_providers WHERE id=?', (provider,)).fetchone())
+            known_provider = provider in ('auto', 'codex', 'gemini', 'antigravity', 'rea', 'web-tess', 'web-chatgpt', 'tess') or bool(db.execute('SELECT id FROM web_providers WHERE id=?', (provider,)).fetchone())
         if not objective or len(objective) > 20000 or not known_provider:
             raise ValueError('Objetivo inválido ou provedor não habilitado')
         if spec is not None and (not isinstance(spec,dict) or ('expected_output' in spec and (not isinstance(spec['expected_output'],str) or len(spec['expected_output'])>20000))):
             raise ValueError('Critério de saída inválido')
+        if spec and 'model' in spec:
+            if provider != 'tess' or not isinstance(spec['model'], str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,150}', spec['model']):
+                raise ValueError('Seleção de modelo exige Tess e um identificador válido.')
         if workflow not in ('direct', 'rea', 'deliver', 'auto', 'visual_review', 'improve', 'work'):
             raise ValueError('Fluxo inválido')
-        if workflow=='auto':
-            from backend.policy import category
-            words=objective.casefold()
-            workflow='work' if any(w in words for w in ('execute ', 'executar ', 'rode ', 'rodar ', 'run tests', 'npm ', 'python3 -m ', 'pytest')) else 'deliver' if any(w in words for w in ('crie ','criar ','desenvolv','implemente','construa','construir','build a','create a')) else 'direct'
+        decision = Decision.classify_mode(objective, {"direct": "analyze", "rea": "plan", "deliver": "artifact", "work": "work", "auto": "auto"}.get(workflow, "analyze"), (spec or {}).get("authorization"))
+        if workflow == "auto":
+            workflow = {"work": "work", "analyze": "direct", "plan": "rea", "artifact": "deliver"}[decision["selected_mode"]]
         if provider.startswith('web-') and workflow not in ('direct', 'rea', 'work', 'deliver', 'improve'):
             raise ValueError('Sessões e agentes de chat suportam resposta e planejamento REA; selecione esses fluxos.')
         if provider == 'rea' and workflow != 'direct':
@@ -166,6 +263,7 @@ class Store:
             if not db.execute('SELECT id FROM projects WHERE id=?', (project,)).fetchone():
                 raise ValueError('Projeto não encontrado')
             spec = dict(spec or {})
+            spec["mode_decision"] = decision
             if spec.get('conversation_parent'):
                 parent = db.execute('SELECT * FROM tasks WHERE id=? AND project_id=?', (spec['conversation_parent'], project)).fetchone()
                 if not parent or parent['status'] in ('running', 'queued'):
@@ -191,8 +289,20 @@ class Store:
             db.execute('INSERT INTO tasks(id,project_id,objective,provider,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',
                        (id, project, objective, provider, 'queued', now(), now()))
             db.execute('UPDATE tasks SET workflow=?,spec=?,requested_provider=? WHERE id=?', (workflow, json.dumps(spec or {}), provider, id))
+            if attachment_ids:
+                from backend.attachments import MAX_TOTAL
+                total = 0
+                for attachment_id in attachment_ids:
+                    row = db.execute('SELECT size,task_id FROM chat_attachments WHERE id=?', (attachment_id,)).fetchone()
+                    if not row or row['task_id'] is not None:
+                        raise ValueError('Anexo inexistente ou já associado')
+                    total += row['size']
+                    if total > MAX_TOTAL:
+                        raise ValueError('Limite total de anexos excedido')
+                for attachment_id in attachment_ids:
+                    db.execute('UPDATE chat_attachments SET task_id=? WHERE id=?', (id, attachment_id))
             db.execute('INSERT INTO commands VALUES(?,?)', (key, id))
-            self.event(db, id, 'queued', {'reason': 'Roteamento automático na execução; política somente leitura', 'workflow': workflow})
+            self.event(db, id, 'queued', {'reason': decision['decision_reason'], 'workflow': workflow})
             return id
 
     def update(self, id, status, **values):
@@ -212,8 +322,19 @@ class Store:
             self.checkpoint(db, task)
             self.event(db, id, status, {'error': values.get('error')})
 
+    def authorize_uncertain_retry(self, task_id, action_id):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status FROM tool_actions WHERE task_id=? AND action_id=?", (task_id, action_id)).fetchone()
+            if not row or row["status"] != "uncertain":
+                raise ValueError("Ação incerta não encontrada")
+            db.execute("UPDATE tool_actions SET status=?,updated_at=? WHERE task_id=? AND action_id=?", ("prepared", now(), task_id, action_id))
+            self.event(db, task_id, 'uncertain_retry_authorized', {'action_id': action_id})
+        return {"ok": True, "warning": "O comando pode já ter sido executado; confira os efeitos antes de autorizar uma nova tentativa."}
+
     def recover(self):
         with self.connect() as db:
+            db.execute("UPDATE tool_actions SET status=? WHERE status=?", ("uncertain", "running"))
             ids = [r[0] for r in db.execute("SELECT id FROM tasks WHERE status IN ('running','queued')")]
         for id in ids:
             self.update(id, 'interrupted', error='Backend reiniciado; retome explicitamente a partir do checkpoint.')
@@ -251,7 +372,7 @@ class Store:
             if any(t['id'] in ids and t['status'] in ('running', 'queued') for t in tasks):
                 raise ValueError('Cancele as execuções ativas antes de excluir a conversa')
             for task_id in ids:
-                for table in ('events', 'checkpoints', 'commands', 'task_steps', 'artifacts', 'visual_reviews', 'revisions'):
+                for table in ('events', 'checkpoints', 'commands', 'task_steps', 'artifacts', 'visual_reviews', 'revisions', 'execution_states', 'tool_actions'):
                     db.execute('DELETE FROM '+table+' WHERE task_id=?', (task_id,))
                 db.execute('DELETE FROM tasks WHERE id=?', (task_id,))
             self.event(db, None, 'conversation_deleted', {'conversation_id': roots[id]})
@@ -261,11 +382,13 @@ class Store:
         with self.connect() as db:
             data = {name: [dict(r) for r in db.execute('SELECT * FROM '+name+order)] for name, order in
                     [('projects', ''), ('tasks', ' ORDER BY created_at DESC'), ('events', ' ORDER BY id DESC LIMIT 500'),
-                     ('checkpoints', ' ORDER BY id DESC LIMIT 200'), ('memory', ' ORDER BY time DESC'), ('task_steps', ' ORDER BY time'), ('artifacts', ' ORDER BY time'), ('visual_reviews', ' ORDER BY time DESC'), ('revisions', ' ORDER BY created_at DESC')]}
+                     ('checkpoints', ' ORDER BY id DESC LIMIT 200'), ('memory', ' ORDER BY time DESC'), ('task_steps', ' ORDER BY time'), ('artifacts', ' ORDER BY time'), ('visual_reviews', ' ORDER BY time DESC'), ('revisions', ' ORDER BY created_at DESC'),
+('execution_states', ''), ('tool_actions', ' ORDER BY created_at'), ('chat_attachments', ' ORDER BY created_at')]}
         roots = self.conversation_roots(data['tasks'])
         for t in data['tasks']:
             t['conversation_id'] = roots[t['id']]
-            t['conversation_history'] = json.loads(t['spec']).get('conversation_history', [])
+            t['spec'] = json.loads(t['spec'])
+            t['conversation_history'] = t['spec'].get('conversation_history', [])
             for field in ('usage','routing','context_metrics','validation'):
                 t[field] = json.loads(t[field])
         for revision in data['revisions']:
@@ -394,9 +517,10 @@ class Supervisor:
         self.adapters['web-tess'] = WebAdapter(DEFAULT_TESS)
         from backend.web_providers import DEFAULT_CHATGPT
         self.adapters['web-chatgpt'] = WebAdapter(DEFAULT_CHATGPT)
-        if os.environ.get('TESS_API_KEY'):
-            from backend.api_providers import ApiAdapter, DEFAULT_TESS_API
-            self.adapters['tess'] = ApiAdapter(DEFAULT_TESS_API)
+        from backend.api_providers import DEFAULT_TESS_API
+        tess_config = dict(DEFAULT_TESS_API, workspace_id=os.environ.get('TESS_WORKSPACE_ID', DEFAULT_TESS_API['workspace_id']),
+                           agent_id=os.environ.get('TESS_AGENT_ID', DEFAULT_TESS_API['agent_id']))
+        self.adapters['tess'] = ApiAdapter(tess_config)
         with store.connect() as db:
             for row in db.execute("SELECT config FROM web_providers"):
                 adapter = WebAdapter(json.loads(row[0]))
@@ -438,6 +562,9 @@ class Supervisor:
             return
         from backend.api_providers import ApiAdapter
         for adapter in list(self.adapters.values()):
+            # A task may start while an earlier provider is being checked.
+            if self.active:
+                return
             try:
                 if isinstance(adapter, WebAdapter):
                     if not adapter.operation.locked():
@@ -509,9 +636,24 @@ class Supervisor:
             if not row:
                 return False
             task = dict(row)
+            persisted = json.loads(task["spec"] or "{}") if isinstance(task.get("spec"), str) else (task.get("spec") or {})
+            mode_decision = persisted.get("mode_decision")
+            if isinstance(mode_decision, dict) and mode_decision.get('decision_blocked'):
+                self.store.update(task['id'], 'blocked', error='Decision local absteve-se; revise o pedido ou selecione um fluxo explícito.')
+                with self.store.connect() as db:
+                    self.store.event(db, task['id'], 'decision_abstained', mode_decision)
+                return True
+            if isinstance(mode_decision, dict) and mode_decision.get("permission_conflict"):
+                self.store.update(task["id"], "blocked", error="permission_conflict: " + ", ".join(mode_decision.get("missing_capabilities", [])))
+                with self.store.connect() as db:
+                    self.store.event(db, task["id"], "permission_conflict", mode_decision)
+                return True
             id = task['id']
             if task['provider']=='auto':
                 candidates=self.providers()
+                if persisted.get('business_generation_id'):
+                    candidates = [p for p in candidates if p['id'] in self.adapters
+                                  and p['id'] not in ('rea', 'gemini')]
                 if task['workflow'] in ('deliver','visual_review', 'improve'):
                     codex_avail = any(p['id']=='codex' and p.get('state')=='available' for p in candidates)
                     if codex_avail:
@@ -542,6 +684,10 @@ class Supervisor:
             def emit(kind, payload):
                 with self.store.connect() as db:
                     self.store.event(db, id, kind, payload)
+                    if kind in ('model_selected', 'model_fallback'):
+                        routing = json.loads(db.execute('SELECT routing FROM tasks WHERE id=?', (id,)).fetchone()[0] or '{}')
+                        routing.update(model=payload.get('model'), model_reason=payload['reason'])
+                        db.execute('UPDATE tasks SET routing=? WHERE id=?', (json.dumps(routing, ensure_ascii=False), id))
                     if kind == 'tool_result':
                         self.store.checkpoint(db, self.store.task(id))
                     if kind == 'message':
@@ -549,11 +695,37 @@ class Supervisor:
                         db.execute('UPDATE tasks SET result=?,updated_at=? WHERE id=?', (old+'\n\n'+payload['text'], now(), id))
             with self.store.connect() as db:
                 memories = [dict(r) for r in db.execute('SELECT * FROM memory WHERE project_id=? ORDER BY time DESC', (task['project_id'],))]
-            prompt, metrics = build_context(task, memories)
+            business_generation_id = persisted.get('business_generation_id')
+            business_work = None
+            if business_generation_id:
+                from backend.business_work import BusinessWork
+                business_work = BusinessWork(self.store.path)
+            execution = self.store.load_execution_state(id) if task['workflow'] == 'work' else None
+            saved_messages = execution.get('messages', []) if execution else []
+            if business_work is not None:
+                prompt = business_work.generation_prompt(business_generation_id)
+                metrics = {'source': 'business_generation', 'prompt_characters': len(prompt)}
+            elif (len(saved_messages) >= 2 and saved_messages[1].get('role') == 'user'
+                    and isinstance(saved_messages[1].get('content'), str)):
+                # AgentRunner restores its complete durable transcript. Rebuilding
+                # a prompt here duplicates the accumulated result and can exceed
+                # the budget before the incremental browser resume even starts.
+                prompt = saved_messages[1]['content']
+                metrics = {'source': 'execution_checkpoint', 'prompt_characters': len(prompt),
+                           'history_rebuilt': False, 'token_savings_proven': False}
+            else:
+                prompt, metrics = build_context(task, memories)
+            from backend.attachments import AttachmentStore
+            attachment_context, attachment_images = AttachmentStore(self.store).context(id)
+            if attachment_context:
+                prompt += '\n\nANEXOS DA MENSAGEM:\n' + attachment_context
+                metrics['attachments'] = len(attachment_images)
             with self.store.connect() as db:
                 db.execute('UPDATE tasks SET context_metrics=? WHERE id=?',(json.dumps(metrics,ensure_ascii=False),id))
                 self.store.event(db,id,'context_prepared',metrics)
             adapter = self.adapter if task['provider'] == 'codex' else self.adapters.get(task['provider'], self.adapter)
+            if isinstance(adapter, ApiAdapter):
+                adapter = adapter.for_task(task, emit)
             def execute_readonly(selected_adapter):
                 if hasattr(selected_adapter, 'chat_turn') or isinstance(selected_adapter, WebAdapter):
                     from backend.agent_engine import run_universal_agent
@@ -561,11 +733,29 @@ class Supervisor:
                     result.pop('files_mutated', None)
                     return result
                 return selected_adapter.execute(prompt, project['path'], emit, cancel)
-            if task['workflow']=='work':
+            if business_work is not None:
+                # Document generation is a queued task, not a filesystem agent.
+                # Use the same provider locks, cancellation and durable task state.
+                if hasattr(adapter, 'chat_turn'):
+                    text, usage = adapter.chat_turn([{'role': 'user', 'content': prompt}], cancel, time.monotonic() + 120)
+                    result = {'status': 'completed', 'result': text, 'usage': usage, 'error': None}
+                    emit('message', {'text': text})
+                else:
+                    if hasattr(adapter, 'begin_run'):
+                        adapter.begin_run()
+                    result = adapter.execute(prompt, project['path'], emit, cancel, timeout=120)
+                if cancel.is_set():
+                    result['status'] = 'cancelled'
+                    result['error'] = 'Geração cancelada; nenhum novo documento foi aceito.'
+                generated = business_work.finalize_generation(business_generation_id, result['status'], result.get('result'), result.get('error'))
+                if generated['status'] != 'completed' and result['status'] == 'completed':
+                    result['status'] = 'needs_review'
+                    result['error'] = generated.get('error') or 'Document generation requires review'
+            elif task['workflow']=='work':
                 from backend.agent_engine import run_universal_agent
                 if not Path(project['path']).is_dir():
                     raise ValueError('Pasta vinculada indisponível')
-                result=run_universal_agent(adapter, prompt, project['path'], emit, cancel)
+                result=run_universal_agent(adapter, prompt, project['path'], emit, cancel, store=self.store, task_id=id)
                 result.pop('files_mutated', None)
             elif task['workflow']=='improve':
                 result=self.run_improvements(task,emit,cancel)
@@ -584,11 +774,13 @@ class Supervisor:
                 result = self.run_rea(task, prompt, project['path'], adapter, emit, cancel)
             else:
                 result = execute_readonly(adapter)
-                if result['status'] in ('rate_limited', 'failed') and not cancel.is_set():
+                # Browser capture failures can follow a successful remote submission.
+                # Never replay an interrupted or uncertain browser request elsewhere.
+                if result['status'] in ('rate_limited', 'failed') and not cancel.is_set() and not isinstance(adapter, WebAdapter) and getattr(adapter, 'config', {}).get('protocol') != 'tess':
                     err_msg = result.get('error') or ''
                     is_quota = result['status'] == 'rate_limited' or any(k in err_msg.lower() for k in ('usage limit', 'rate limit', 'quota'))
                     if is_quota or result['status'] == 'failed':
-                        failover = Decision.decide_failover(task, task['provider'], err_msg, self.providers())
+                        failover = Decision.decide_failover(task, task['provider'], err_msg, self.providers(), error_status=result['status'])
                         if failover:
                             alt_provider = failover['selected_provider']
                             emit('provider_failover', {
@@ -696,6 +888,8 @@ class Supervisor:
                 comparison='\nCOMPARAÇÃO OBRIGATÓRIA: As primeiras '+str(after_count)+' imagens são DEPOIS, na ordem do relatório. As imagens seguintes são ANTES: '+json.dumps(mapping)+'. Para cada critério selecionado classifique atendido, parcial, não atendido ou não verificável, citando diferenças realmente visíveis. Não atribua melhorias a partir de código ou de uma promessa. Critérios e feedback: '+json.dumps({'proposals':improvement['proposals'],'feedback':improvement['feedback']},ensure_ascii=False)
                 with self.store.connect() as db:db.execute('UPDATE visual_reviews SET capture=? WHERE task_id=?',(json.dumps(report,ensure_ascii=False),task['id']))
         active_adapter = self.adapters.get(task.get('provider'), self.adapter)
+        if isinstance(active_adapter, ApiAdapter):
+            active_adapter = active_adapter.for_task(task, emit)
         if hasattr(active_adapter, 'execute_visual'):
             result = active_adapter.execute_visual(review_prompt(prompt_parent,report)+comparison,str(path),emit,cancel,images)
         else:
@@ -779,6 +973,8 @@ class Supervisor:
             emit('revision_snapshot_created',{'base_path':str(base),'candidate_path':str(candidate)})
             with self.store.connect() as db:db.execute("UPDATE revisions SET status='editing' WHERE task_id=?",(task['id'],))
             active_adapter = self.adapters.get(task.get('provider'), self.adapter)
+            if isinstance(active_adapter, ApiAdapter):
+                active_adapter = active_adapter.for_task(task, emit)
             if hasattr(active_adapter, 'execute_improvements'):
                 result = active_adapter.execute_improvements(improvement_prompt(spec),str(candidate),emit,cancel,images)
             else:
@@ -890,6 +1086,8 @@ class Supervisor:
                     'Registre controles, estado implementado, limitações e validações reais em README.md, PROJECT_STATE.md e QA_REPORT.md. Rode node --check nos seus JS. '
                     'Esta etapa autoriza escrever código dentro deste workspace: não se limite a planejar. Produza o MVP agora.')
             active_adapter = self.adapters.get(task.get('provider'), self.adapter)
+            if isinstance(active_adapter, ApiAdapter):
+                active_adapter = active_adapter.for_task(task, emit)
             if hasattr(active_adapter, 'execute_build'):
                 result = active_adapter.execute_build(prompt, str(path), emit, cancel)
             else:

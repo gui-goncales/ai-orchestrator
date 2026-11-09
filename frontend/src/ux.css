@@ -1,0 +1,47 @@
+
+/* UX refinements: legibilidade, foco, alvos de toque e estados.
+   Carregado depois de style.css para ajustar sem duplicar componentes. */
+
+/* Navegação por teclado */
+.skip-link{position:absolute;left:12px;top:-64px;z-index:100;background:var(--accent);color:#201b32;padding:10px 14px;border-radius:6px;font-size:12px;font-weight:600}
+.skip-link:focus{top:12px}
+html[data-theme=light] .skip-link{color:#fff}
+#main-content:focus{outline:none}
+.task-row:focus-visible,.palette>button:focus-visible,.kanban-card:focus-visible{outline-offset:-2px}
+
+/* Localização atual mais evidente */
+nav button{min-height:40px}
+nav button.active{box-shadow:inset 3px 0 0 var(--accent);font-weight:600}
+.breadcrumb strong{font-weight:600}
+
+/* Botões: altura mínima para alvo de clique confortável */
+.primary,.secondary{min-height:38px}
+
+/* Legibilidade: nenhum texto abaixo de 11px */
+.eyebrow,.metric small,.agent-detail,.agent-detail strong,.agent-card>p,.agent-footer,.badge,.task-row small,
+.event p,.event strong,.continuity p,.live,.footer-tag,footer,.folder-count,.count,kbd,.profile strong,
+.profile small,.local-card p,.nav-label,nav small,.connection,.table-head,.inspector-item>span,.inspector-item p,
+.message small,.chat-provider-badge,.chat-id,.chat-bubble-time,.chat-code-lang,.chat-code-copy,.folder-empty,
+.visual-evidence span,.proposal-option small,.agents-summary>span,.agents-security,.agents-tabs button,
+.connection-status,.connection-card>p,.connection-scope,.connection-actions>.primary,.connection-actions>.secondary,
+.connection-add small,.connection-add-link,.discovery-card small,.discovery-note,.utility-row p,.utility-row>span,
+.connect-steps li,.connect-steps li>span,.connect-options small,.connect-advanced p,.connect-session-state,
+.connect-privacy,.agents-intro .eyebrow,.connect-dialog-header .eyebrow,.agents-utilities summary,
+.execution-timeline-count,.execution-timeline-item-main small,.execution-timeline-item time,
+.execution-timeline-item pre,.execution-timeline-note,.execution-timeline-empty,.inspector-validation-facts>div,
+.bw-eyebrow,.bw-upload span,.bw-upload small,.bw-source small,.bw-steps b,.bw-editor-hint,.bw-edit-trigger,
+summary,details pre,.memory-item small,.task-row>span:last-child,.text-button,.panel-bottom{font-size:11px}
+.nav-label{color:var(--muted)}
+
+/* Contraste do placeholder nos dois temas */
+.chat-textarea::placeholder,input::placeholder,textarea::placeholder{color:var(--muted);opacity:.85}
+
+/* Erros dentro de modais ficam visíveis (o toast fica atrás do <dialog>) */
+form>.error{margin-top:4px}
+
+/* Estado da coluna Kanban e áreas de toque em telas pequenas */
+@media(max-width:800px){
+  .icon-btn,.chat-icon-btn,.folder-add-btn{min-width:40px;min-height:40px}
+  .page-heading .primary{font-size:12px;min-height:40px}
+  .mobile-nav{font-size:13px;min-height:40px}
+}

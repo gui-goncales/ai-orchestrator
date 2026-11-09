@@ -29,6 +29,7 @@ interface FolderTreeProps {
   taskFolderMap: Record<string, string>; // taskId -> folderId
   onMoveTaskToFolder: (taskId: string, folderId: string | null) => void;
   onNewTaskInFolder?: (folderId: string | null) => void;
+  onConfigureFolder?: (folderId: string) => void;
   labels: Record<string, string>;
 }
 
@@ -45,8 +46,10 @@ export function FolderTree({
   onMoveTaskToFolder,
   onNewTaskInFolder,
   labels,
+  onConfigureFolder,
 }: FolderTreeProps) {
   const [search, setSearch] = useState('');
+ const [statusFilter, setStatusFilter] = useState('all');
   const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
@@ -76,12 +79,14 @@ export function FolderTree({
   };
 
   // Filter tasks based on search
-  const filteredTasks = tasks.filter(t =>
-    t.objective.toLowerCase().includes(search.toLowerCase()) ||
-    t.id.toLowerCase().includes(search.toLowerCase())
-  );
+  const normalize = (value: string) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+ const query = normalize(search.trim());
+ const filteredTasks = tasks.filter(t =>
+ (statusFilter === 'all' || t.status === statusFilter) &&
+ (normalize(t.objective).includes(query) || normalize(t.id).includes(query))
+ );
 
-  // Group tasks by folder
+ // Group tasks by folder
   const tasksByFolder: Record<string, Task[]> = {};
   const unassignedTasks: Task[] = [];
 
@@ -108,6 +113,7 @@ export function FolderTree({
           <input
             type="text"
             placeholder="Buscar conversas..."
+ aria-label="Buscar conversas por objetivo ou identificador"
             value={search}
             onChange={e => setSearch(e.target.value)}
           />
@@ -121,7 +127,15 @@ export function FolderTree({
             </button>
           )}
         </div>
-        <button
+        <select aria-label="Filtrar conversas por status" value={statusFilter} onChange={e => setStatusFilter(e.target.value)} className="conversation-status-filter">
+ <option value="all">Todos</option>
+ <option value="running">Em execução</option>
+ <option value="queued">Na fila</option>
+ <option value="completed">Concluídos</option>
+ <option value="failed">Falhas</option>
+ <option value="needs_review">Revisão</option>
+ </select>
+ <button
           className="folder-add-btn"
           onClick={() => {
             setIsCreatingFolder(true);
@@ -201,6 +215,7 @@ export function FolderTree({
                 </button>
 
                 <div className="folder-actions">
+                  <button type="button" className="icon-btn-xs" title="Vincular diretório" aria-label={"Vincular diretório de " + folder.name} onClick={()=>onConfigureFolder?.(folder.id)}><FolderInput size={13}/></button>
                   {isEditing ? (
                     <button
                       className="icon-btn-xs"
@@ -326,6 +341,7 @@ function TaskTreeItem({
   isMenuOpen,
   onToggleMenu,
   labels,
+  onConfigureFolder,
 }: {
   task: Task;
   isSelected: boolean;
@@ -336,6 +352,7 @@ function TaskTreeItem({
   onDelete: () => void;
   isMenuOpen: boolean;
   onToggleMenu: () => void;
+  onConfigureFolder?: (folderId: string) => void;
   labels: Record<string, string>;
 }) {
   const statusColorClass =

@@ -12,7 +12,7 @@ Requer CLI instalada e autenticação indicada pelo probe ou execução anterior
 
 Entre elegíveis, usa conclusões estruturais da categoria da tarefa como evidência limitada de operação, não como prova de superioridade semântica. Não atribui capacidade por reputação de modelo. Empate é estável. Comparação por tokens só é habilitada quando todos os candidatos têm ao menos três amostras com uso reportado e qualidade aceita pelo usuário **para o mesmo objetivo e fluxo**. Mesmo assim, não é garantia estatística de qualidade futura.
 
-Nenhum elegível: status blocked, sem consumir cota. Escolha fica fixa durante a tarefa e suas retomadas: não implementa failover geral. Exceção validada: etapa REA somente leitura que termina sem resposta pública no Gemini pode continuar em Codex, conforme RECOVERY.md. Restaurar acesso e retomar explicitamente uma tarefa bloqueada permite nova decisão se ainda não houve escolha. Sinais de cota não são contornados.
+Nenhum elegível: status blocked, sem consumir cota. Nos pontos de recuperação implementados pelo supervisor, sinais de cota ou indisponibilidade podem acionar failover para outro provedor elegível. O Decision aplica filtros e gates locais; erros genéricos de configuração não bastam. Há também recuperação específica de etapa REA somente leitura que termina sem resposta pública no Gemini para Codex, conforme RECOVERY.md. Restaurar acesso e retomar explicitamente uma tarefa bloqueada permite nova decisão se ainda não houve escolha. Veja [Decision local e limites](DECISION-LOCAL.md); não há dependência da API do JEV.
 
 ## Otimização com preservação
 

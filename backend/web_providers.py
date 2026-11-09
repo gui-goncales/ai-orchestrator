@@ -76,7 +76,18 @@ class WebAdapter:
         self.controls_mapped = False
         self.execution_validated = False
         self.connection_error = None
+        self.bridge_protocol = None
+        self.worker_version = None
+        self.capture_mode = None
         self.operation = threading.Lock()
+        self.operation_state = threading.Lock()
+        self.operation_kind = None
+        self.check_cancel = None
+        self.execution_waiting = False
+        self.run_context = threading.local()
+
+    def begin_run(self):
+        self.run_context.binding = None
 
     @property
     def profile(self):
@@ -95,7 +106,8 @@ class WebAdapter:
         return {'id': self.id, 'name': self.config['name'], 'installed': bool(shutil.which('node') and Path(CHROME).is_file()),
                 'state': self.state, 'auth': 'Login da conta · sessão no Chrome dedicado',
                 'config': self.config, 'session_ready': self.session_ready, 'controls_mapped': self.controls_mapped,
-                'execution_validated': self.execution_validated, 'connection_error': self.connection_error, 'automatic_routing': True,
+                'execution_validated': self.execution_validated, 'connection_error': self.connection_error,
+                'bridge_protocol': self.bridge_protocol, 'worker_version': self.worker_version, 'capture_mode': self.capture_mode, 'automatic_routing': True,
                 'capabilities': {'read_only': True, 'write': False, 'streaming': False, 'browser_session': True}}
 
     def open_login(self):
@@ -125,7 +137,7 @@ class WebAdapter:
             if not self.config.get('extension_id'):
                 return {'status': 'authentication_required', 'session_ready': False, 'controls_mapped': False, 'result': '', 'usage': {}, 'error': 'Instale a extensão local, conecte a aba ChatGPT e informe o ID em Ajustar conexão.'}
             from backend.browser_bridge import bridge
-            return bridge.request(self.config['extension_id'], action, prompt, cancel, timeout)
+            return bridge.request(self.config['extension_id'], action, prompt, cancel, timeout, getattr(self.run_context, 'binding', None))
         endpoint = self.endpoint()
         if not endpoint:
             return {'status': 'authentication_required', 'result': '', 'usage': {}, 'error': 'Abra o login no navegador dedicado.'}
@@ -136,7 +148,7 @@ class WebAdapter:
         from tempfile import TemporaryFile
         with TemporaryFile() as incoming, TemporaryFile() as outgoing:
             incoming.write(json.dumps({'action': action, 'endpoint': endpoint, 'config': self.config, 'prompt': prompt,
-                                       'timeout_ms': max(1000, (timeout-2)*1000)}).encode());incoming.seek(0)
+                                       'context': getattr(self.run_context, 'binding', None), 'timeout_ms': max(1000, (timeout-2)*1000)}).encode());incoming.seek(0)
             proc = subprocess.Popen([node, str(ROOT/'scripts'/'web-session.cjs')], cwd=ROOT, stdin=incoming,
                                     stdout=outgoing, stderr=subprocess.DEVNULL, start_new_session=True)
             start = time.monotonic()
@@ -146,6 +158,7 @@ class WebAdapter:
                     try: proc.wait(timeout=3)
                     except subprocess.TimeoutExpired: proc.kill();proc.wait()
                     return {'status': 'cancelled' if cancel.is_set() else 'interrupted', 'result': '', 'usage': {},
+                            'reason': 'local_transport_timeout', 'submitted': None,
                             'error': 'Espera local interrompida; confira a conversa antes de retomar para não duplicar o envio.'}
             outgoing.seek(0)
             try:
@@ -153,13 +166,27 @@ class WebAdapter:
                 if not isinstance(result,dict): raise ValueError()
                 return result
             except (ValueError, TypeError):
-                return {'status':'failed','result':'','usage':{},'error':'Não foi possível controlar a sessão. Reabra o login.'}
+                return {'status':'failed','result':'','usage':{},'reason':'local_transport_failed','submitted':None,'error':'Não foi possível controlar a sessão. Reabra o login.'}
 
     def check(self):
-        if not self.operation.acquire(blocking=False):
-            raise ValueError('Sessão ocupada por outra operação.')
+        # Health checks are read-only and may yield to a user execution. The
+        # operation mutex still prevents concurrent access to the browser.
+        with self.operation_state:
+            if self.execution_waiting or not self.operation.acquire(blocking=False):
+                raise ValueError('Sessão ocupada por outra operação.')
+            self.operation_kind = 'check'
+            check_cancel = self.check_cancel = threading.Event()
         try:
-            result = self.command('check', threading.Event())
+            result = self.command('check', check_cancel)
+            if check_cancel.is_set():
+                return {'status': 'interrupted', 'reason': 'health_check_preempted',
+                        'state': self.state, 'execution_validated': self.execution_validated}
+            self.bridge_protocol = result.get('bridge_protocol')
+            self.worker_version = result.get('worker_version')
+            self.capture_mode = result.get('capture_mode')
+            if self.config.get('transport') == 'extension' and result.get('session_ready') and (self.bridge_protocol != 2 or self.capture_mode != 'async_poll'):
+                result = {**result, 'controls_mapped': False, 'reason': 'extension_upgrade_required', 'error':
+                          'Extensão ativa sem protocolo de captura 2. Recarregue AI Orchestrator · ChatGPT 0.2.0 no Chrome.'}
             for key, value in (result.get('suggested_config') or {}).items():
                 if key in ('input_selector', 'response_selector', 'busy_selector') and not self.config.get(key):
                     self.config[key] = value
@@ -169,13 +196,70 @@ class WebAdapter:
             self.state = ('available' if self.controls_mapped else 'validation_required') if self.session_ready else ('session_closed' if result.get('reason') in ('browser_unavailable', 'conversation_missing') else 'authentication_required')
             return {**result, 'state': self.state, 'execution_validated': self.execution_validated}
         finally:
-            self.operation.release()
+            with self.operation_state:
+                self.check_cancel = None
+                self.operation_kind = None
+                self.operation.release()
+
+    def acquire_execution(self, cancel, deadline):
+        with self.operation_state:
+            if self.execution_waiting:
+                return False, 'local_session_busy'
+            if self.operation.acquire(blocking=False):
+                self.operation_kind = 'execute'
+                return True, None
+            if self.operation_kind != 'check':
+                return False, 'local_session_busy'
+            self.execution_waiting = True
+            self.check_cancel.set()
+        try:
+            # Wait only for the cancelled health check to release its mutex.
+            # Never restart or displace another execution or send a second command.
+            while not cancel.is_set() and time.monotonic() < deadline:
+                if self.operation.acquire(timeout=min(.05, max(0, deadline-time.monotonic()))):
+                    with self.operation_state:
+                        self.operation_kind = 'execute'
+                    return True, 'health_check_preempted'
+            return False, 'cancelled_before_submission' if cancel.is_set() else 'local_lock_timeout'
+        finally:
+            with self.operation_state:
+                self.execution_waiting = False
 
     def execute(self, prompt, cwd, on_event, cancel, timeout=600):
-        if not self.operation.acquire(blocking=False):
-            return {'status':'failed','result':'','usage':{},'error':'Sessão ocupada.'}
+        started = time.monotonic()
+        if cancel.is_set():
+            acquired, reason = False, 'cancelled_before_submission'
+        else:
+            acquired, reason = self.acquire_execution(cancel, started + min(5, max(0, timeout)))
+        if not acquired:
+            on_event('browser_round', {'input_bytes': len(prompt.encode('utf-8')),
+                     'duration_ms': round((time.monotonic()-started)*1000),
+                     'submitted': False, 'reason': reason})
+            return {'status': 'cancelled' if cancel.is_set() else 'failed', 'result': '', 'usage': {},
+                    'error': 'Cancelado antes do envio.' if cancel.is_set() else
+                    'Sessão local ocupada; nenhuma mensagem foi enviada. Aguarde a operação atual.'}
         try:
-            result = self.command('execute', cancel, prompt, timeout)
+            if reason:
+                on_event('browser_session_wait', {'reason': reason,
+                         'duration_ms': round((time.monotonic()-started)*1000)})
+            if cancel.is_set() or time.monotonic()-started >= timeout:
+                on_event('browser_round', {'input_bytes': len(prompt.encode('utf-8')),
+                         'duration_ms': round((time.monotonic()-started)*1000),
+                         'submitted': False, 'reason': 'cancelled_before_submission' if cancel.is_set() else 'local_lock_timeout'})
+                return {'status': 'cancelled' if cancel.is_set() else 'failed', 'result': '', 'usage': {},
+                        'error': 'Espera local encerrada antes de qualquer envio.'}
+            try:
+                result = self.command('execute', cancel, prompt, max(0, timeout-(time.monotonic()-started)))
+            except (OSError, ValueError) as exc:
+                result = {'status': 'failed', 'reason': 'local_transport_failed', 'submitted': None,
+                          'error': 'Falha local no transporte do navegador; confira a aba antes de retomar.'}
+            if result.get('context'):
+                self.run_context.binding = result['context']
+            on_event('browser_round', {'input_bytes': len(prompt.encode('utf-8')),
+                     'duration_ms': round((time.monotonic()-started)*1000),
+                     'submitted': result.get('submitted'),
+                     'reason': result.get('reason', result.get('status')),
+                     **{key: result[key] for key in ('channel_phase', 'bridge_protocol', 'worker_version', 'poll_count', 'job_id') if key in result}})
             self.state = 'available' if result.get('status')=='completed' else result.get('status','failed')
             self.execution_validated = result.get('status')=='completed'
             if result.get('status') == 'session_closed':
@@ -187,4 +271,6 @@ class WebAdapter:
                 on_event('message', {'text': result['result']})
             return {key: result.get(key, default) for key, default in [('status', 'failed'), ('result', ''), ('usage', {}), ('error', None)]}
         finally:
-            self.operation.release()
+            with self.operation_state:
+                self.operation_kind = None
+                self.operation.release()

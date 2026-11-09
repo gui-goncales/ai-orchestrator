@@ -85,6 +85,13 @@ function TextMarkdown({ text }: { text: string }) {
   let inList = false;
   let listItems: React.ReactNode[] = [];
   let listType: 'ul' | 'ol' = 'ul';
+ let paragraphLines: string[] = [];
+ const flushParagraph = (key: string) => {
+ if (paragraphLines.length) {
+ elements.push(<p key={key} className="chat-p">{formatInline(paragraphLines.join(' '))}</p>);
+ paragraphLines = [];
+ }
+ };
 
   const flushList = (key: string) => {
     if (listItems.length > 0) {
@@ -102,6 +109,12 @@ function TextMarkdown({ text }: { text: string }) {
     const trimmed = line.trim();
 
     // Headers
+ if (trimmed === '') {
+ flushParagraph(`paragraph-${index}`);
+ flushList(`flush-${index}`);
+ return;
+ }
+ if (/^(#{1,3} |>|[-*]\s+|\d+\.\s+)/.test(trimmed)) flushParagraph(`paragraph-${index}`);
     if (line.startsWith('### ')) {
       flushList(`flush-${index}`);
       elements.push(<h4 key={index} className="chat-h3">{formatInline(line.slice(4))}</h4>);
@@ -155,20 +168,13 @@ function TextMarkdown({ text }: { text: string }) {
       return;
     }
 
-    // Empty line or regular paragraph
-    flushList(`flush-${index}`);
-    if (trimmed === '') {
-      elements.push(<div key={`empty-${index}`} className="chat-spacer" />);
-    } else {
-      elements.push(
-        <p key={index} className="chat-p">
-          {formatInline(line)}
-        </p>
-      );
-    }
-  });
+    // Consecutive lines belong to the same paragraph; blank lines separate blocks.
+ flushList(`flush-${index}`);
+ paragraphLines.push(trimmed);
+ });
 
-  flushList('flush-final');
+  flushParagraph('paragraph-final');
+ flushList('flush-final');
 
   return <>{elements}</>;
 }

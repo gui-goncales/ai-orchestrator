@@ -3,6 +3,7 @@ import json
 import re
 import statistics
 from backend.decision import Decision
+from backend.agent_routing import exclusion_reason
 
 
 def category(objective):
@@ -19,12 +20,14 @@ def choose(task, providers, history):
     excluded=[]
     for provider in providers:
         id=provider['id']
-        if id not in ('codex','antigravity') and not provider.get('automatic_routing'):
-            continue  # Legacy Gemini and artifact tools are never silent substitutes.
+        reason = exclusion_reason(provider)
+        if reason:
+            excluded.append({'provider': id, 'reason': reason})
+            continue
         past=[t for t in history if t['provider']==id and t['id']!=task['id']]
         latest=next((t for t in past if t['status'] not in ('queued','running')),None)
         blocked=bool(latest and latest['status'] in ('failed','rate_limited','authentication_required','interrupted'))
-        if not provider.get('installed') or blocked or provider.get('state') != 'available':
+        if blocked:
             excluded.append({'provider':id,'reason':'indisponível, autenticação/cota bloqueada ou sem execução validada'})
             continue
         relevant=[t for t in past if category(t['objective'])==kind]
@@ -67,8 +70,10 @@ def build_context(task, memories, reference_budget=10000):
         if score>0 and used+len(memory['content'])<=reference_budget:
             selected.append(memory);used+=len(memory['content'])
         else:omitted.append(memory['id'])
-    constraints=[('Escrita autorizada somente na pasta vinculada ao projeto; preserve arquivos protegidos.' if task.get('workflow')=='work' else 'Somente leitura; não alterar arquivos nem executar ações externas.'),'Preservar requisitos e trabalho confirmado.']
     plan=Decision.plan_task(task)
+    constraints=[('Escrita autorizada somente na pasta vinculada ao projeto; preserve arquivos protegidos.' if plan['write_allowed'] else 'Somente leitura; não alterar arquivos.'),
+                 ('Comandos autorizados pelo contrato na pasta vinculada.' if plan['commands_allowed'] else 'Execução de comandos não autorizada neste fluxo.'),
+                 'Preservar requisitos e trabalho confirmado. Resultados shadow e abstenções do Decision não concedem permissões.']
     packet={'objective':objective,'constraints':constraints,
             'execution_plan':{k:v for k,v in plan.items() if k != 'objective'}}
     spec=task.get('spec') or {}

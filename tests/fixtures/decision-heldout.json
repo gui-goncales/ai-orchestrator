@@ -1,0 +1,18 @@
+[
+  ["Compare o comportamento das duas versões e apresente as diferenças em texto.", "analyze", false],
+  ["Proponha as etapas para substituir a fila; a execução ficará para outro dia.", "plan", false],
+  ["Remova a duplicação do parser e mantenha a interface pública.", "work", true],
+  ["Produza um arquivo CSV com os dados deste exemplo sintético.", "artifact", true],
+  ["Não adicione a funcionalidade. Quero entender quanto esforço ela exigiria.", "analyze", false],
+  ["A frase 'corrija o backend' é um exemplo. Explique por que ela é ambígua.", "analyze", false],
+  ["Organize um plano de investigação do vazamento de memória, sem iniciar a investigação.", "plan", false],
+  ["Update the validation function to reject empty addresses.", "work", true],
+  ["Describe the bug without changing the implementation.", "analyze", false],
+  ["Create a spreadsheet file summarizing these measurements.", "artifact", true],
+  ["Give me a phased implementation plan. Leave the code untouched.", "plan", false],
+  ["Se o teste demonstrar a regressão, ajuste a função responsável.", "work", true],
+  ["Quero um diagnóstico dos riscos de atualizar a dependência, sem fazer a atualização.", "analyze", false],
+  ["Implemente paginação na consulta e acrescente testes de limite.", "work", true],
+  ["Exporte a análise para um documento DOCX.", "artifact", true],
+  ["Defina a sequência de tarefas para internacionalizar a interface. Não altere arquivos nesta etapa.", "plan", false]
+]

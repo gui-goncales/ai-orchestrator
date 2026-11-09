@@ -8,7 +8,7 @@ const fs=require('node:fs');
  try{
  const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.goto('http://127.0.0.1:8788');await page.getByText('Conectado',{exact:true}).waitFor();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Agentes',exact:true}).click();
  await page.getByLabel('Protocolo',{exact:true}).selectOption('openai');
  await page.getByLabel('ID da conexão',{exact:true}).fill('api-smoke');await page.getByLabel('Nome',{exact:true}).fill('Modelo de teste');
  await page.getByLabel('URL base',{exact:true}).fill('http://127.0.0.1:'+api.address().port+'/v1');await page.getByLabel('Modelo',{exact:true}).fill('fixture-model');

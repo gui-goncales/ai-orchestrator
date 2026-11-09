@@ -6,6 +6,7 @@ __pycache__/
 .DS_Store
 
 tools/bin/
+tools/decision-runtime/
 
 artifacts/
 
@@ -16,3 +17,5 @@ artifacts/
 # Local execution evidence can contain account details and screenshots.
 evidence/
 *.log
+
+.orchestrator-results/

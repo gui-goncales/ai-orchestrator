@@ -9,10 +9,10 @@ class BrowserBridge:
         self.lock = threading.Lock()
         self.jobs = {}
 
-    def request(self, extension_id, action, prompt, cancel, timeout):
+    def request(self, extension_id, action, prompt, cancel, timeout, context=None):
         job_id = uuid.uuid4().hex
         job = {'id': job_id, 'extension_id': extension_id, 'action': action,
-               'prompt': prompt, 'timeout_ms': min(max(int(timeout * 1000) - 2000, 1000), 180000)}
+               'prompt': prompt, 'context': context, 'timeout_ms': max(int(timeout * 1000) - 2000, 1000)}
         entry = {'job': job, 'dispatched': False, 'result': None, 'done': threading.Event()}
         with self.lock:
             self.jobs[job_id] = entry
@@ -20,8 +20,15 @@ class BrowserBridge:
             deadline = time.monotonic() + timeout
             while not entry['done'].wait(.1):
                 if cancel.is_set() or time.monotonic() >= deadline:
+                    with self.lock:
+                        if entry['done'].is_set():
+                            return entry['result']
+                        dispatched = entry['dispatched']
+                        self.jobs.pop(job_id, None)
                     return {'status': 'cancelled' if cancel.is_set() else 'interrupted',
-                            'result': '', 'usage': {}, 'error': 'Extensão não confirmou o resultado. Mantenha o orquestrador aberto e confira a aba antes de reenviar.'}
+                            'reason': 'capture_timeout' if dispatched else 'local_dispatch_timeout',
+                            'submitted': None if dispatched else False, 'result': '', 'usage': {},
+                            'error': 'Extensão não confirmou o resultado. Mantenha o orquestrador aberto e confira a aba antes de reenviar.'}
             return entry['result']
         finally:
             with self.lock:

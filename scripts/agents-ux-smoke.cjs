@@ -1,7 +1,7 @@
 const {chromium}=require('playwright');const fs=require('node:fs');
 (async()=>{const browser=await chromium.launch({channel:'chrome',headless:true});try{
  const page=await browser.newPage({viewport:{width:1440,height:1100}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
- await page.goto('http://127.0.0.1:8788');await page.getByText('Conectado',{exact:true}).waitFor();await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.goto('http://127.0.0.1:8788');await page.getByText('Conectado',{exact:true}).waitFor();await page.getByRole('button',{name:'Agentes',exact:true}).click();
  await page.getByRole('heading',{name:'Seu time de IA, conectado.',exact:true}).waitFor();
  await page.getByRole('button',{name:'Prontos',exact:true}).click();if(await page.locator('.connection-card').count()!==1)throw Error('Ready filter wrong');
  await page.getByRole('button',{name:'Todos',exact:true}).click();await page.getByLabel('Buscar agentes').fill('not-a-provider');await page.getByRole('heading',{name:'Nenhum agente encontrado'}).waitFor();await page.getByLabel('Buscar agentes').fill('');

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import copy
 from urllib import request, error, parse
 
 
@@ -52,6 +53,56 @@ class ApiAdapter:
         self.config = validate(config)
         self.id = self.config['id']
         self.state = 'validation_required'
+        self.models = []
+        self.models_checked_at = 0
+        self.on_model_event = lambda *args: None
+        self.automatic_model = False
+
+    def discover_models(self, deadline):
+        data = self.http('/agents/' + self.config['agent_id'], None, deadline)
+        models = []
+        for question in data.get('questions', []):
+            if question.get('name') == 'model':
+                for value in question.get('options', []):
+                    if isinstance(value, str) and value != 'auto' and re.fullmatch(r'[A-Za-z0-9_.-]{1,150}', value):
+                        models.append(value)
+        self.models = list(dict.fromkeys(models))
+        self.models_checked_at = time.monotonic()
+        return self.models
+
+    def for_task(self, task, on_event):
+        """Keep selection and fallback local to this execution, never other tasks."""
+        if self.config['protocol'] != 'tess':
+            return self
+        if time.monotonic() - self.models_checked_at > 300:
+            self.discover_models(time.monotonic() + 15)
+        spec = task.get('spec') or {}
+        if isinstance(spec, str):
+            spec = json.loads(spec)
+        requested = spec.get('model', 'auto')
+        if requested != 'auto' and requested not in self.models:
+            raise ValueError('Modelo não disponível no agente Tess; atualize a conexão.')
+        bound = copy.copy(self)
+        bound.config = dict(self.config)
+        bound.on_model_event = on_event
+        bound.automatic_model = requested == 'auto'
+        objective = task['objective'].casefold()
+        complex_task = task.get('workflow') in ('work', 'deliver', 'improve', 'rea') or len(objective) > 1500 or any(word in objective for word in ('arquitetura', 'architecture', 'depur', 'debug', 'complex'))
+        # Family names are heuristics, not measured cost or quality claims.
+        preferred = ('sonnet', 'sol', 'coder', 'pro') if complex_task else ('flash', 'mini', 'luna', 'haiku')
+        ranked = sorted(self.models, key=lambda model: (
+            next((i for i, name in enumerate(preferred) if name in model.lower()), len(preferred)),
+            0 if model.endswith('-high' if complex_task else '-low') else 1,
+            self.models.index(model)))
+        bound.model_candidates = ranked if requested == 'auto' else [requested]
+        selected = bound.model_candidates[0] if bound.model_candidates else None
+        if selected:
+            bound.config['model'] = selected
+        else:
+            bound.config.pop('model', None)
+        on_event('model_selected', {'model': selected, 'requested_model': requested,
+                 'reason': 'Escolha manual.' if requested != 'auto' else 'Heurística por complexidade e família do modelo; custos e qualidade não medidos.' if selected else 'Catálogo ausente; usando o padrão do agente Tess.'})
+        return bound
 
     def probe(self):
         c = self.config
@@ -61,7 +112,7 @@ class ApiAdapter:
         return {'id': self.id, 'name': c['name'], 'installed': True,
                 'state': state,
                 'auth': auth,
-                'config': c, 'capabilities': {'read_only': False, 'write': True, 'streaming': False, 'api': True},
+                'config': c, 'models': self.models, 'capabilities': {'read_only': False, 'write': True, 'streaming': False, 'api': True},
                 'automatic_routing': True}
 
     def check(self):
@@ -71,15 +122,15 @@ class ApiAdapter:
             return {'state': self.state, 'error': f"Defina {self.config.get('key_env', 'chave')} no ambiente."}
         try:
             if self.config['protocol'] == 'tess':
-                self.http('/agents/' + self.config['agent_id'], None, time.monotonic() + 10)
+                self.discover_models(time.monotonic() + 10)
             self.state = 'available'
             return {'state': 'available', 'ok': True}
         except error.HTTPError as exc:
             self.state = 'authentication_required' if exc.code in (401, 403) else 'failed'
             return {'state': self.state, 'error': f'API retornou HTTP {exc.code}.'}
-        except Exception as exc:
+        except Exception:
             self.state = 'failed'
-            return {'state': self.state, 'error': str(exc)}
+            return {'state': self.state, 'error': 'Não foi possível verificar a API.'}
 
     def http(self, path, payload, deadline):
         headers = {'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': 'ai-orchestrator/1.0'}
@@ -110,8 +161,32 @@ class ApiAdapter:
         if c.get('model'):
             payload['model'] = c['model']
         if c['protocol'] == 'tess':
+            normalized = []
+            for message in messages:
+                role = 'developer' if message['role'] == 'system' else message['role']
+                if role not in ('developer', 'user', 'assistant') or (role == 'developer' and normalized):
+                    raise ValueError('Sequência de mensagens incompatível com Tess.')
+                if normalized and normalized[-1]['role'] == role:
+                    normalized[-1]['content'] += '\n\n' + message['content']
+                else:
+                    normalized.append({'role': role, 'content': message['content']})
+            payload['messages'] = normalized
             payload.update({'tools': 'no-tools', 'waitExecution': False})
-            data = self.http('/agents/' + c['agent_id'] + '/execute', payload, deadline)
+            try:
+                data = self.http('/agents/' + c['agent_id'] + '/execute', payload, deadline)
+            except error.HTTPError as exc:
+                candidates = getattr(self, 'model_candidates', [])
+                if not self.automatic_model or exc.code not in (429, 503) or len(candidates) < 2 or cancel.is_set() or time.monotonic() >= deadline:
+                    raise error.HTTPError('', exc.code, 'Falha na API Tess', {}, None) from None
+                previous = payload.get('model')
+                self.model_candidates = candidates[1:]
+                c['model'] = self.model_candidates[0]
+                payload['model'] = c['model']
+                self.on_model_event('model_fallback', {'previous_model': previous, 'model': c['model'], 'reason': 'HTTP ' + str(exc.code)})
+                try:
+                    data = self.http('/agents/' + c['agent_id'] + '/execute', payload, deadline)
+                except error.HTTPError as retry_exc:
+                    raise error.HTTPError('', retry_exc.code, 'Falha na API Tess', {}, None) from None
             responses = data.get('responses')
             if not isinstance(responses, list) or len(responses) != 1 or not isinstance(responses[0], dict):
                 raise ValueError('Resposta do Tess em formato inesperado')

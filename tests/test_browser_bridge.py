@@ -34,6 +34,57 @@ class BrowserBridgeTests(unittest.TestCase):
         self.assertEqual(result['status'], 'cancelled')
         self.assertIsNone(bridge.next_job())
 
+    def test_timeout_before_dispatch_reports_not_submitted(self):
+        bridge = BrowserBridge()
+        result = bridge.request('a'*32, 'execute', 'fixture', threading.Event(), .01)
+        self.assertEqual(result['reason'], 'local_dispatch_timeout')
+        self.assertIs(result['submitted'], False)
+        self.assertIsNone(bridge.next_job())
+
+    def test_cancel_after_dispatch_preserves_uncertain_submission(self):
+        bridge = BrowserBridge()
+        cancel = threading.Event()
+        results = []
+        thread = threading.Thread(target=lambda: results.append(
+            bridge.request('a'*32, 'execute', 'fixture', cancel, 2)))
+        thread.start()
+        job = None
+        for _ in range(100):
+            job = bridge.next_job()
+            if job:
+                break
+            threading.Event().wait(.01)
+        try:
+            self.assertIsNotNone(job)
+            cancel.set()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(results[0]['reason'], 'capture_timeout')
+            self.assertIsNone(results[0]['submitted'])
+            self.assertFalse(bridge.complete(job['id'], {'status': 'completed', 'result': 'late'}))
+        finally:
+            cancel.set()
+            thread.join(2)
+
     def test_rejects_invalid_response(self):
         with self.assertRaises(ValueError):
             BrowserBridge().complete('unknown', {'status':'completed','result':{'unexpected':True}})
+
+    def test_long_timeout_and_binding_are_forwarded_without_three_minute_cap(self):
+        bridge = BrowserBridge()
+        cancel = threading.Event()
+        thread = threading.Thread(target=lambda: bridge.request('a'*32, 'execute', 'fixture', cancel, 600,
+                                                               {'url': 'fixture', 'count': 2}))
+        thread.start()
+        job = None
+        for _ in range(100):
+            job = bridge.next_job()
+            if job: break
+            threading.Event().wait(.01)
+        try:
+            self.assertGreater(job['timeout_ms'], 180000)
+            self.assertEqual(job['context']['count'], 2)
+            self.assertIsNone(bridge.next_job())
+        finally:
+            cancel.set()
+            thread.join(2)

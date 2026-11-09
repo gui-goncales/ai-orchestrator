@@ -17,18 +17,18 @@ import {
   PanelRight,
   AlertCircle,
   FileCode,
-  Layers,
   ChevronRight,
-  RefreshCw
+  RefreshCw, Paperclip, X
 } from 'lucide-react';
 import { Task, Data, Revision } from '../types';
 import { MarkdownRenderer } from './MarkdownRenderer';
+import { ExecutionTimeline } from './ExecutionTimeline';
 
 interface ChatViewProps {
   task: Task | undefined;
   data: Data;
   online: boolean;
-  onSendMessage: (objective: string, provider: string, workflow: string) => Promise<void>;
+  onSendMessage: (objective: string, provider: string, workflow: string, model?: string, files?: File[]) => Promise<void>;
   onAction: (path: string, body?: any) => Promise<any>;
   onSelectTask: (taskId: string) => void;
   showInspector: boolean;
@@ -49,6 +49,20 @@ interface ChatViewProps {
   onNewChat: () => void;
 }
 
+const isPreviewableImage = (file: File) => /\.(png|jpe?g|webp|gif)$/i.test(file.name) || file.type.startsWith('image/');
+
+function AttachmentPreview({ file, onOpen }: { file: File; onOpen: (url: string, name: string) => void }) {
+ const [url, setUrl] = useState('');
+ useEffect(() => {
+ if (!isPreviewableImage(file)) return;
+ const objectUrl = URL.createObjectURL(file);
+ setUrl(objectUrl);
+ return () => URL.revokeObjectURL(objectUrl);
+ }, [file]);
+ if (!url) return <FileCode size={22} aria-hidden="true" />;
+ return <button type="button" className="chat-attachment-open" aria-label={`Ampliar imagem ${file.name}`} onClick={() => onOpen(url, file.name)}><img className="chat-attachment-thumbnail" src={url} alt="" /></button>;
+}
+
 export function ChatView({
   task,
   data,
@@ -63,17 +77,55 @@ export function ChatView({
   RevisionPanelComponent,
   onNewChat,
 }: ChatViewProps) {
-  const [inputPrompt, setInputPrompt] = useState('');
-  const [selectedProvider, setSelectedProvider] = useState<string>('auto');
-  const [selectedWorkflow, setSelectedWorkflow] = useState<string>('direct');
+  const draftKey = `orchestrator_chat_draft_${task?.conversation_id || task?.id || 'new'}`;
+ const [inputPrompt, setInputPrompt] = useState(() => {
+ try { return localStorage.getItem(draftKey) || ''; }
+ catch { return ''; }
+ });
+ useEffect(() => {
+ try {
+ if (inputPrompt) localStorage.setItem(draftKey, inputPrompt);
+ else localStorage.removeItem(draftKey);
+ } catch { /* Storage may be disabled in private sessions. */ }
+ }, [draftKey, inputPrompt]);
+ const [selectedProvider, setSelectedProvider] = useState<string>('auto');
+ const [selectedModel, setSelectedModel] = useState('auto');
+ const tessModels = data.providers.find(p => p.id === 'tess')?.models || [];
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
+  const [files, setFiles] = useState<File[]>([]);
+ const [expandedImage, setExpandedImage] = useState<{ url: string; name: string } | null>(null);
+ useEffect(() => {
+ if (!expandedImage) return;
+ const onEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setExpandedImage(null); };
+ document.addEventListener('keydown', onEscape);
+ return () => document.removeEventListener('keydown', onEscape);
+ }, [expandedImage]);
+  const [uploading, setUploading] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const allowed = new Set('png jpg jpeg webp gif pdf docx doc txt md markdown csv xlsx xls json xml svg js jsx ts tsx py html css scss java c cpp h hpp go rs sh sql yaml yml'.split(' '));
+  const addFiles = (incoming: File[]) => {
+   setSubmitError('');
+   const valid = incoming.filter(f => {
+   const ext = f.name.split('.').pop()?.toLowerCase() || '';
+   if (!allowed.has(ext) || !f.size || f.size > 20 * 1024 * 1024) { setSubmitError('Arquivo não suportado, vazio ou acima de 20 MB: ' + f.name); return false; }
+   return true;
+   });
+   setFiles(previous => {
+   const merged = [...previous];
+   for (const file of valid) if (!merged.some(f => f.name === file.name && f.size === file.size && f.lastModified === file.lastModified)) merged.push(file);
+   if (merged.length > 10 || merged.reduce((n, f) => n + f.size, 0) > 60 * 1024 * 1024) { setSubmitError('Limite de 10 arquivos e 60 MB por mensagem.'); return previous; }
+   return merged;
+   });
+  };
   const [copiedResponse, setCopiedResponse] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+const hasInitiallyScrolled = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    if (task) { setSelectedProvider(task.provider); setSelectedWorkflow(task.workflow || 'auto'); }
+    if (task) { setSelectedProvider(task.provider); }
+    setSelectedModel(task?.spec?.model || 'auto');
   }, [task?.id]);
 
   const readyProviders = data.providers.filter(isChatProviderReady);
@@ -85,7 +137,16 @@ export function ChatView({
 
   // Auto-scroll on new message or task change
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const end = messagesEndRef.current;
+ const container = end?.closest('.chat-thread');
+ if (!end || !container) return;
+ const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 160;
+ if (!hasInitiallyScrolled.current) {
+container.scrollTop = container.scrollHeight;
+hasInitiallyScrolled.current = true;
+} else if (nearBottom) {
+container.scrollTop = container.scrollHeight;
+}
   }, [task?.id, task?.result, task?.status]);
 
   // Auto-grow textarea
@@ -98,7 +159,7 @@ export function ChatView({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       handleSubmit();
     }
@@ -106,12 +167,15 @@ export function ChatView({
 
   const handleSubmit = async () => {
     const trimmed = inputPrompt.trim();
-    if (!trimmed || isSubmitting || !online || !providerReady || task?.status === 'running' || task?.status === 'queued') return;
+    if ((!trimmed && !files.length) || isSubmitting || !online || !providerReady || task?.status === 'running' || task?.status === 'queued') return;
 
     setSubmitError('');
     setIsSubmitting(true);
     try {
-      await onSendMessage(trimmed, selectedProvider, selectedWorkflow);
+      setUploading(true);
+ await onSendMessage(trimmed, selectedProvider, 'auto', selectedProvider === 'tess' ? selectedModel : undefined, files);
+ setFiles([]);
+ try { localStorage.removeItem(draftKey); } catch {}
       setInputPrompt('');
       if (textareaRef.current) {
         textareaRef.current.style.height = 'auto';
@@ -120,6 +184,7 @@ export function ChatView({
       setSubmitError((error as Error).message);
     } finally {
       setIsSubmitting(false);
+ setUploading(false);
     }
   };
 
@@ -141,7 +206,6 @@ export function ChatView({
   };
 
   const visibleResponse = task?.result?.replace(/<(?:tool_call|action)\s+name=[\s\S]*?<\/(?:tool_call|action)>/gi, '').trim() || '';
-  const toolActivity = data.events.filter(e => e.task_id === task?.id && e.kind === 'tool_call').slice().reverse();
 
   const isRunning = task?.status === 'running' || task?.status === 'queued';
 
@@ -153,7 +217,7 @@ export function ChatView({
           {task ? (
             <>
               <h2 className="chat-title" title={task.objective}>
-                {task.objective}
+                {task.objective.split(/\n/)[0].replace(/^#+\s*/, '').slice(0, 85)}
               </h2>
               <div className="chat-meta">
                 <span className="chat-provider-badge">
@@ -164,13 +228,13 @@ export function ChatView({
                   <span className="dot" />
                   {labels[task.status] || task.status}
                 </span>
-                <span className="mono chat-id">#{task.id.slice(0, 8)}</span>
+
               </div>
             </>
           ) : (
             <div>
               <h2 className="chat-title">Nova Conversa</h2>
-              <p className="chat-subtitle">Pronto para orquestrar agentes e tarefas.</p>
+              <p className="chat-subtitle">Ideias, código e decisões em um só lugar.</p>
             </div>
           )}
         </div>
@@ -195,7 +259,9 @@ export function ChatView({
                   alert('Ainda não há checkpoint para exportar.');
                 }
               }}
-              title="Exportar checkpoint JSON"
+              title={data.checkpoints.some(c => c.task_id === task.id) ? 'Exportar checkpoint JSON' : 'Checkpoint ainda indisponível para esta conversa'}
+              aria-label="Exportar checkpoint JSON"
+              disabled={!data.checkpoints.some(c => c.task_id === task.id)}
             >
               <Download size={15} />
             </button>
@@ -223,7 +289,7 @@ export function ChatView({
             </div>
             <h3>O que você deseja construir ou analisar?</h3>
             <p>
-              Converse sobre o projeto ou escolha Work para editar os arquivos da pasta conectada.
+              Explore uma ideia, planeje o próximo passo ou transforme seu projeto.
             </p>
             <div className="quick-suggestions">
               <button
@@ -233,7 +299,7 @@ export function ChatView({
                   setInputPrompt('Analise a arquitetura do projeto e sugira otimizações.')
                 }
               >
-                Analisar arquitetura do projeto
+                <Search size={17} /><span>Analisar projeto<small>Entenda a arquitetura e encontre melhorias</small></span><ArrowUpRight size={15} />
               </button>
               <button
                 type="button"
@@ -242,7 +308,7 @@ export function ChatView({
                   setInputPrompt('Criar uma funcionalidade com validação de tipagem e testes.')
                 }
               >
-                Desenvolver nova funcionalidade
+                <FileCode size={17} /><span>Criar funcionalidade<small>Transforme uma ideia em implementação</small></span><ArrowUpRight size={15} />
               </button>
               <button
                 type="button"
@@ -251,7 +317,7 @@ export function ChatView({
                   setInputPrompt('Analise os arquivos do projeto e proponha um plano de implementação.')
                 }
               >
-                Planejar uma alteração
+                <Sparkles size={17} /><span>Planejar próximos passos<small>Defina uma abordagem antes de começar</small></span><ArrowUpRight size={15} />
               </button>
             </div>
           </div>
@@ -296,7 +362,9 @@ export function ChatView({
               <div className="chat-bubble assistant-bubble">
                 <div className="chat-bubble-author">
                   <strong>{providerName(task.provider)}</strong>
-                  {task.workflow && (
+                  {task.routing?.model && <span className="workflow-badge" title={task.routing.model_reason}>{task.routing.model}</span>}
+                  {task.spec?.mode_decision && (<span className="workflow-badge" title={task.spec.mode_decision.decision_reason}>Solicitado: {task.spec.mode_decision.requested_mode} · Selecionado: {task.spec.mode_decision.selected_mode}{task.spec.mode_decision.permission_conflict ? " · Permissão bloqueada" : ""}</span>)}
+ {task.workflow && (
                     <span className="workflow-badge">{({direct:'Análise',work:'Work',rea:'Planejamento',deliver:'Artefato',improve:'Melhoria'} as Record<string,string>)[task.workflow] || task.workflow}</span>
                   )}
                   <div className="bubble-actions">
@@ -323,16 +391,27 @@ export function ChatView({
                   </div>
                 </div>
 
+                {data.events.filter(event => event.task_id === task.id && event.kind === 'model_fallback').map(event => <p key={event.id} role="status" className="chat-p-muted">Modelo alterado de {event.payload.previous_model} para {event.payload.model}: {event.payload.reason}.</p>)}
                 {/* Assistant Output Content */}
-                <div className="assistant-content">
-                  {task.status === 'running' && !task.result ? (
-                    <div className="ai-thinking-state">
-                      <RefreshCw size={14} className="spin text-accent" />
-                      <span>Agente processando resposta e gerando saídas…</span>
-                    </div>
-                  ) : visibleResponse ? (
-                    <MarkdownRenderer content={visibleResponse} />
-                  ) : isRunning ? (
+                <div className="assistant-content" aria-live="polite">
+                  {task.status === 'queued' && !task.result ? (
+ <div className="ai-thinking-state" role="status">Na fila · aguardando início da execução.</div>
+ ) : task.status === 'running' && !task.result ? (
+ <div className="ai-thinking-state" role="status">
+ <RefreshCw size={14} className="spin text-accent" />
+ <span>Execução em andamento · acompanhe as ações registradas abaixo.</span>
+ </div>
+ ) : visibleResponse ? (
+ <>
+ <p className="chat-p-muted" role="status">
+ {task.status === 'failed' ? 'Execução falhou · saída possivelmente incompleta' : task.status === 'running' || task.status === 'queued' ? 'Saída intermediária · execução em andamento' : task.status === 'completed' ? 'Execução concluída · qualidade sujeita à revisão' : 'Saída registrada'}
+ </p>
+ {task.status === 'failed' && (
+ <div className="chat-error-box" role="alert"><AlertCircle size={15} /><span>{task.error || 'A execução falhou.'}</span></div>
+ )}
+ <MarkdownRenderer content={visibleResponse} />
+ </>
+ ) : isRunning ? (
                     <p className="chat-p-muted">Consultando o projeto…</p>
                   ) : task.status === 'failed' ? (
                     <div className="chat-error-box">
@@ -460,7 +539,7 @@ export function ChatView({
                     />
                   ))}
 
-                {toolActivity.length > 0 && <details className="chat-tool-activity"><summary>{toolActivity.length} ações no projeto</summary><ul>{toolActivity.map(e => <li key={e.id}><span>{({read_file:'Leitura',list_dir:'Pasta',find_files:'Busca',write_file:'Escrita',edit_file:'Edição',delete_file:'Exclusão'} as Record<string,string>)[e.payload.name] || e.payload.name}</span> <code>{e.payload.args?.path || e.payload.args?.pattern || ''}</code></li>)}</ul></details>}
+<details className="workspace-execution-details"><summary>Detalhes da execução <span>Eventos, checkpoints e validações</span></summary><ExecutionTimeline task={task} data={data} /></details>
                 {/* Action Bar inside Assistant Message */}
                 <div className="chat-msg-footer">
                   {task.workflow === 'rea' && task.status === 'completed' && (
@@ -505,10 +584,10 @@ export function ChatView({
                         type="button"
                         className="secondary-sm"
                         disabled={!online}
-                        onClick={() => onAction(`tasks/${task.id}/accept`)}
+                        onClick={() => { if (window.confirm("Aceitar a qualidade registra sua aprovação desta versão. Execução concluída não significa testes aprovados. Você revisou o resultado e deseja aceitar a qualidade?")) void onAction(`tasks/${task.id}/accept`); }}
                       >
                         <Check size={13} />
-                        Aceitar qualidade
+                        Revisar e aceitar qualidade
                       </button>
                     )}
                 </div>
@@ -521,11 +600,25 @@ export function ChatView({
       </div>
 
       {/* Bottom Floating Prompt Dock */}
-      <div className="chat-input-dock">
-        <div className="chat-input-wrapper">
-          <textarea
+      <div className="chat-input-dock" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (!isSubmitting && !isRunning) addFiles(Array.from(e.dataTransfer.files)); }}>
+ <input ref={fileInput} type="file" multiple hidden onChange={e => { addFiles(Array.from(e.target.files || [])); e.target.value = ""; }} />
+ {uploading && <p role="status">Enviando {files.length} arquivo(s)…</p>}
+ <div className="chat-input-wrapper">
+ {files.length > 0 && (
+ <div className="chat-attachment-list" aria-label="Anexos selecionados">
+ {files.map((file, index) => (
+ <div className={`chat-attachment-item ${isPreviewableImage(file) ? 'is-image' : 'is-document'}`} key={`${file.name}-${file.size}-${file.lastModified}`}>
+ <AttachmentPreview file={file} onOpen={(url, name) => setExpandedImage({ url, name })} />
+ {!isPreviewableImage(file) && <span title={file.name}>{file.name}</span>}
+ <button type="button" className="chat-attachment-remove" aria-label={`Remover ${file.name}`} disabled={isSubmitting} onClick={() => { setExpandedImage(null); setFiles(old => old.filter((_, i) => i !== index)); }}><X size={14}/></button>
+ </div>
+ ))}
+ </div>
+ )}
+ <textarea
             ref={textareaRef}
             className="chat-textarea"
+            aria-label="Mensagem para o agente"
             placeholder={
               task
                 ? 'Continue a conversa…'
@@ -534,12 +627,21 @@ export function ChatView({
             value={inputPrompt}
             onChange={handleInputChange}
             onKeyDown={handleKeyDown}
+ onPaste={e => { const images = Array.from(e.clipboardData.files).filter(f => isPreviewableImage(f)); if (images.length) { e.preventDefault(); addFiles(images); } }}
             rows={1}
             disabled={!online || isSubmitting || isRunning}
           />
 
           <div className="chat-input-controls">
             <div className="chat-controls-left">
+ <button type="button" className="icon-btn" title="Anexar arquivos" aria-label="Anexar arquivos" disabled={!online || isSubmitting || isRunning} onClick={() => fileInput.current?.click()}><Paperclip size={17}/></button>
+              {selectedProvider === 'tess' && <div className="control-pill-group">
+                <select className="control-select" aria-label="Modelo Tess" value={selectedModel}
+                  disabled={!online || isRunning || isSubmitting} onChange={e => setSelectedModel(e.target.value)}>
+                  <option value="auto">Modelo automático</option>
+                  {tessModels.map(model => <option key={model} value={model}>{model}</option>)}
+                </select>
+              </div>}
               {/* Provider Quick Selector */}
               <div className="control-pill-group">
                 <Bot size={13} />
@@ -563,23 +665,7 @@ export function ChatView({
                 </select>
               </div>
 
-              {/* Workflow Quick Selector */}
-              <div className="control-pill-group">
-                <Layers size={13} />
-                <select
-                  value={selectedWorkflow}
-                  onChange={e => setSelectedWorkflow(e.target.value)}
-                  className="control-select"
-                  title="Tipo de fluxo"
-                  aria-label="Modo de trabalho"
-                  disabled={isRunning}
-                >
-                  <option value="auto">Decidir pelo objetivo</option>
-                  <option value="work">Work · arquivos e comandos</option><option value="deliver">Criar artefato</option>
-                  <option value="direct">Analisar · somente leitura</option>
-                  <option value="rea">Planejar</option>
-                </select>
-              </div>
+
             </div>
 
             <div className="chat-controls-right">
@@ -597,22 +683,43 @@ export function ChatView({
                 <button
                   type="button"
                   className="chat-send-btn"
-                  disabled={!inputPrompt.trim() || isSubmitting || !online || !providerReady}
+                  disabled={(!inputPrompt.trim() && !files.length) || isSubmitting || !online || !providerReady}
                   onClick={handleSubmit}
                   title="Enviar mensagem (Enter)"
                 >
-                  <ArrowUp size={16} />
+                  <ArrowUp size={16} /><span>Enviar</span>
                 </button>
               )}
             </div>
           </div>
         </div>
 
-        {submitError && <p role="alert" className="chat-submit-error">{submitError}</p>}
+        {expandedImage && (
+<div
+className="chat-image-lightbox"
+role="presentation"
+onMouseDown={event => {
+if (event.target === event.currentTarget) setExpandedImage(null);
+}}
+>
+<div className="chat-image-lightbox-content" role="dialog" aria-modal="true" aria-label={`Visualização de ${expandedImage.name}`}>
+<button
+type="button"
+className="chat-image-lightbox-close"
+aria-label="Fechar imagem ampliada"
+onClick={() => setExpandedImage(null)}
+>
+<X size={22} />
+</button>
+<img src={expandedImage.url} alt={expandedImage.name} />
+</div>
+</div>
+)}
+{submitError && <p role="alert" className="chat-submit-error">{submitError}</p>}
         {!readyProviders.length && <p role="status" className="chat-submit-error">Nenhum agente pronto. Conecte e valide um agente na página Agents.</p>}
         <div className="chat-input-hint">
           <span>
-            {!online ? 'Offline' : selectedWorkflow === 'work' ? 'Permite editar a pasta do projeto' : selectedWorkflow === 'direct' ? 'Leitura da pasta · sem alterações' : 'Enter para enviar'}
+            {!online ? 'Offline' : 'Enter para enviar'}
           </span>
           <span className="hint-divider">·</span>
           <span>Shift + Enter para quebrar linha</span>

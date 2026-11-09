@@ -28,6 +28,19 @@ class CoreTests(unittest.TestCase):
         self.tmp.cleanup()
     def create(self, key='key'):
         return self.store.create('Analisar requisitos essenciais sem perder restrições', 'local', 'auto', key)
+    def test_chat_attachment_creates_task_and_prevents_reuse(self):
+        from backend.attachments import AttachmentStore
+        attachments = AttachmentStore(self.store)
+        uploaded = attachments.put('documento.txt', b'Conteudo de teste para a conversa')
+        self.assertTrue(uploaded['id'])
+        task_id = self.store.create('', 'local', 'auto', 'attachment-message-1', workflow='auto', attachment_ids=[uploaded['id']])
+        with self.store.connect() as db:
+            row = db.execute('SELECT task_id FROM chat_attachments WHERE id=?', (uploaded['id'],)).fetchone()
+        self.assertEqual(row['task_id'], task_id)
+        self.assertEqual(self.store.task(task_id)['objective'], 'Analise os arquivos anexados.')
+        with self.assertRaisesRegex(ValueError, 'Anexo inexistente ou já associado'):
+            self.store.create('Segunda mensagem', 'local', 'auto', 'attachment-message-2', attachment_ids=[uploaded['id']])
+
     def test_idempotent_creation(self):
         self.assertEqual(self.create(), self.create())
         self.assertEqual(len(self.store.snapshot()['tasks']), 1)
